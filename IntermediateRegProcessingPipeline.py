@@ -1,4 +1,6 @@
 #Import libraries-
+import os
+os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # required for network filesystems (ceph, NFS)
 import numpy as np
 import nibabel as nib
 from ApplyTranforms import *
@@ -134,7 +136,7 @@ def MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder):
         if moving_key == "ExVivoBlock":
             paths["Fixed_FilePath"] = BlockFaceToNifti(paths["Fixed_Folder"])
 
-        SlicerTPath = next(Path(paths['RegFold']).glob("*.h5"), None)
+        SlicerTPath = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
 
         PrepForLandMarker(
             movingimpath     = paths['Moving_FilePath'],

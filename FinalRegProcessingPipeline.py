@@ -1,4 +1,6 @@
 #Import libraries-
+import os
+os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # required for network filesystems (ceph, NFS)
 import numpy as np
 import nibabel as nib
 from ApplyTranforms import *
@@ -34,8 +36,8 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed):
         fixedimpath       = str(paths['Fixed_FilePath'])
         fixed_nib         = nib.load(fixedimpath)
         fixed_nib_canonical = nib.as_closest_canonical(fixed_nib)
-        SlicerTPath       = next(Path(paths['RegFold']).glob("*.h5"), None)
-        dfieldpath        = next(Path(paths['RegFold']).glob("*.pt"), None)
+        SlicerTPath       = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
+        dfieldpath        = next((p for p in Path(paths['RegFold']).glob("*.pt") if not p.name.startswith("._")), None)
 
         warn_if_oblique(paths['Fixed_FilePath'])
         if current_volume is None:
