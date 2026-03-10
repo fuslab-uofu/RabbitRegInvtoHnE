@@ -5,7 +5,7 @@ import numpy as np
 import nibabel as nib
 from ApplyTranforms import *
 from RabbitPathFInder import *
-from NiftyTransforms import makesegfromvol, match_histograms, bin_intensities
+from NiftyTransforms import makesegfromvol, match_histograms, bin_intensities, DimsDivFour
 from datetime import datetime
 import matplotlib.pyplot as plt
 import glob
@@ -66,10 +66,10 @@ def PrepForLandMarker(movingimpath, fixedimpath, SlicerTPath, output_dir,
         moving_binned_out = os.path.join(output_dir, f"{label(moving_stage)}PreparedFor{label(fixed_stage)}_binned.nii.gz")
         fixed_out         = os.path.join(fixed_dir,  f"{label(fixed_stage)}Masked.nii.gz")
         fixed_binned_out  = os.path.join(fixed_dir,  f"{label(fixed_stage)}Masked_binned.nii.gz")
-        nib.save(nib.Nifti1Image(resampled_matched.astype(np.float32), fixed_nib_canonical.affine), moving_out)
-        nib.save(nib.Nifti1Image(resampled_binned.astype(np.float32),  fixed_nib_canonical.affine), moving_binned_out)
-        nib.save(nib.Nifti1Image(fixed_masked.astype(np.float32),      fixed_nib_canonical.affine), fixed_out)
-        nib.save(nib.Nifti1Image(fixed_binned.astype(np.float32),      fixed_nib_canonical.affine), fixed_binned_out)
+        nib.save(nib.Nifti1Image(DimsDivFour(resampled_matched).astype(np.float32), fixed_nib_canonical.affine), moving_out)
+        nib.save(nib.Nifti1Image(DimsDivFour(resampled_binned).astype(np.float32),  fixed_nib_canonical.affine), moving_binned_out)
+        nib.save(nib.Nifti1Image(DimsDivFour(fixed_masked).astype(np.float32),      fixed_nib_canonical.affine), fixed_out)
+        nib.save(nib.Nifti1Image(DimsDivFour(fixed_binned).astype(np.float32),      fixed_nib_canonical.affine), fixed_binned_out)
         print(f"Saved masked+matched moving to {moving_out}")
         print(f"Saved masked+matched+binned moving to {moving_binned_out}")
         print(f"Saved masked fixed to {fixed_out}")
@@ -95,7 +95,7 @@ def BlockFaceToNifti(blockface_folder):
         return output_path
 
     cropped_images_dir = os.path.join(blockface_folder, 'CroppedImages')
-    files = sorted([f for f in os.listdir(cropped_images_dir) if f.endswith('.tiff')])
+    files = sorted([f for f in os.listdir(cropped_images_dir) if f.endswith('.tiff') and not f.startswith('._')])
 
     slices = []
     for f in files:
