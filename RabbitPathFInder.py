@@ -6,7 +6,7 @@ import numpy as np
 
 def find_nii(directory):
     for ext in ("*.nii.gz", "*.nii"):
-        matches = list(Path(directory).glob(ext))
+        matches = [p for p in Path(directory).glob(ext) if not p.name.startswith("._")]
         if matches:
             return matches[0]
     return None
