@@ -62,14 +62,17 @@ def PrepForLandMarker(movingimpath, fixedimpath, SlicerTPath, output_dir,
         fixed_dir = fixed_output_dir if fixed_output_dir is not None else output_dir
         os.makedirs(fixed_dir, exist_ok=True)
 
-        moving_out        = os.path.join(output_dir, f"{label(moving_stage)}PreparedFor{label(fixed_stage)}.nii.gz")
-        moving_binned_out = os.path.join(output_dir, f"{label(moving_stage)}PreparedFor{label(fixed_stage)}_binned.nii.gz")
+        resampled_out     = os.path.join(output_dir, f"{label(moving_stage)}ResampledTo{label(fixed_stage)}.nii.gz")
+        moving_out        = os.path.join(output_dir, f"{label(moving_stage)}MaskedTo{label(fixed_stage)}.nii.gz")
+        moving_binned_out = os.path.join(output_dir, f"{label(moving_stage)}MaskedTo{label(fixed_stage)}_binned.nii.gz")
         fixed_out         = os.path.join(fixed_dir,  f"{label(fixed_stage)}Masked.nii.gz")
         fixed_binned_out  = os.path.join(fixed_dir,  f"{label(fixed_stage)}Masked_binned.nii.gz")
+        nib.save(nib.Nifti1Image(resampled,                                          fixed_nib_canonical.affine), resampled_out)
         nib.save(nib.Nifti1Image(DimsDivFour(resampled_matched).astype(np.float32), fixed_nib_canonical.affine), moving_out)
         nib.save(nib.Nifti1Image(DimsDivFour(resampled_binned).astype(np.float32),  fixed_nib_canonical.affine), moving_binned_out)
         nib.save(nib.Nifti1Image(DimsDivFour(fixed_masked).astype(np.float32),      fixed_nib_canonical.affine), fixed_out)
         nib.save(nib.Nifti1Image(DimsDivFour(fixed_binned).astype(np.float32),      fixed_nib_canonical.affine), fixed_binned_out)
+        print(f"Saved resampled moving to {resampled_out}")
         print(f"Saved masked+matched moving to {moving_out}")
         print(f"Saved masked+matched+binned moving to {moving_binned_out}")
         print(f"Saved masked fixed to {fixed_out}")
@@ -152,8 +155,8 @@ def MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder):
 
 
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
-RabbitFolder='/Users/jbonaventura/Downloads/RabbitData'
-RabbitID="R23-055"
-Block = 5
+RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
+RabbitID="R24-240"
+Block = 1
 
 MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder)
