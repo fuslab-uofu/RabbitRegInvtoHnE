@@ -33,16 +33,69 @@ class VolumeViewer(QMainWindow):
         self.update_plot()
 
     def initUI(self):
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 1000, 650)
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         main_layout = QVBoxLayout(self.central_widget)
 
+        # Top row: canvas left, button panel right
+        top_layout = QHBoxLayout()
+
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
-        main_layout.addWidget(self.canvas)
         self.ax = self.figure.add_subplot(111)
+        top_layout.addWidget(self.canvas, stretch=1)
 
+        btn_panel = QWidget()
+        btn_panel.setFixedWidth(160)
+        btn_layout = QVBoxLayout(btn_panel)
+        btn_layout.setAlignment(Qt.AlignTop)
+        btn_layout.setSpacing(6)
+
+        if self.load_callback is not None:
+            load_btn = QPushButton('Load Volume')
+            load_btn.clicked.connect(self.load_callback)
+            btn_layout.addWidget(load_btn)
+
+        if self.save_callback is not None:
+            save_btn = QPushButton('Save Segmentation')
+            save_btn.clicked.connect(self.save_callback)
+            btn_layout.addWidget(save_btn)
+
+        if self.undo_callback is not None:
+            undo_btn = QPushButton('Delete Last Point')
+            undo_btn.clicked.connect(self.undo_callback)
+            btn_layout.addWidget(undo_btn)
+
+        if self.expand_to_max_callback is not None:
+            self._expand_btn = QPushButton('Expand to Max: OFF')
+            self._expand_btn.setCheckable(True)
+            self._expand_btn.setStyleSheet('QPushButton:checked { background-color: #2980b9; color: white; }')
+            self._expand_btn.toggled.connect(self._toggle_expand_to_max)
+            btn_layout.addWidget(self._expand_btn)
+
+        if self.cut_callback is not None:
+            self._cut_btn = QPushButton('Cut Mode: OFF')
+            self._cut_btn.setCheckable(True)
+            self._cut_btn.setStyleSheet('QPushButton:checked { background-color: #c0392b; color: white; }')
+            self._cut_btn.toggled.connect(self._toggle_cut_mode)
+            btn_layout.addWidget(self._cut_btn)
+
+            self._cut_radius_label = QLabel(f'Cut Radius: {self.cut_radius}')
+            btn_layout.addWidget(self._cut_radius_label)
+            self._cut_radius_slider = QSlider(Qt.Horizontal)
+            self._cut_radius_slider.setMinimum(0)
+            self._cut_radius_slider.setMaximum(10)
+            self._cut_radius_slider.setValue(self.cut_radius)
+            self._cut_radius_slider.setTickPosition(QSlider.TicksBelow)
+            self._cut_radius_slider.setTickInterval(1)
+            self._cut_radius_slider.valueChanged.connect(self._cut_radius_changed)
+            btn_layout.addWidget(self._cut_radius_slider)
+
+        top_layout.addWidget(btn_panel)
+        main_layout.addLayout(top_layout)
+
+        # Bottom sliders
         slider_layout = QHBoxLayout()
         self.slider_label = QLabel(f"Slice: {self.current_slice}/{self.depth - 1}")
         self.slider = QSlider(Qt.Horizontal)
@@ -71,48 +124,6 @@ class VolumeViewer(QMainWindow):
 
         if self.seed_callback is not None:
             self.canvas.mpl_connect('button_press_event', self._on_click)
-
-        if self.load_callback is not None:
-            load_btn = QPushButton('Load Volume')
-            load_btn.clicked.connect(self.load_callback)
-            main_layout.addWidget(load_btn)
-
-        if self.save_callback is not None:
-            save_btn = QPushButton('Save Segmentation')
-            save_btn.clicked.connect(self.save_callback)
-            main_layout.addWidget(save_btn)
-
-        if self.expand_to_max_callback is not None:
-            self._expand_btn = QPushButton('Expand to Max: OFF')
-            self._expand_btn.setCheckable(True)
-            self._expand_btn.setStyleSheet('QPushButton:checked { background-color: #2980b9; color: white; }')
-            self._expand_btn.toggled.connect(self._toggle_expand_to_max)
-            main_layout.addWidget(self._expand_btn)
-
-        if self.undo_callback is not None:
-            undo_btn = QPushButton('Delete Last Point')
-            undo_btn.clicked.connect(self.undo_callback)
-            main_layout.addWidget(undo_btn)
-
-        if self.cut_callback is not None:
-            self._cut_btn = QPushButton('Cut Mode: OFF')
-            self._cut_btn.setCheckable(True)
-            self._cut_btn.setStyleSheet('QPushButton:checked { background-color: #c0392b; color: white; }')
-            self._cut_btn.toggled.connect(self._toggle_cut_mode)
-            main_layout.addWidget(self._cut_btn)
-
-            cut_radius_layout = QHBoxLayout()
-            self._cut_radius_label = QLabel(f'Cut Radius: {self.cut_radius}')
-            self._cut_radius_slider = QSlider(Qt.Horizontal)
-            self._cut_radius_slider.setMinimum(0)
-            self._cut_radius_slider.setMaximum(10)
-            self._cut_radius_slider.setValue(self.cut_radius)
-            self._cut_radius_slider.setTickPosition(QSlider.TicksBelow)
-            self._cut_radius_slider.setTickInterval(1)
-            self._cut_radius_slider.valueChanged.connect(self._cut_radius_changed)
-            cut_radius_layout.addWidget(self._cut_radius_label)
-            cut_radius_layout.addWidget(self._cut_radius_slider)
-            main_layout.addLayout(cut_radius_layout)
 
     def _toggle_expand_to_max(self, checked):
         self.expand_to_max = checked

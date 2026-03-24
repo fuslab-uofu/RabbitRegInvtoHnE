@@ -1,3 +1,4 @@
+import os
 import sys
 import nibabel as nib
 import numpy as np
@@ -119,7 +120,7 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
 
     # Mutable state — use a dict so closures can reassign without nonlocal
-    state = {'arr': None, 'nib_img': None, 'mask': None}
+    state = {'arr': None, 'nib_img': None, 'mask': None, 'dir': ''}
     seeds = []
     cuts = []
     action_log = []
@@ -134,6 +135,7 @@ if __name__ == '__main__':
         state['arr'] = arr
         state['nib_img'] = img
         state['mask'] = np.zeros_like(arr, dtype=bool)
+        state['dir'] = os.path.dirname(os.path.abspath(path))
 
     def _reset_session():
         """Clear all seeds, cuts, and mask for a fresh segmentation."""
@@ -179,7 +181,7 @@ if __name__ == '__main__':
 
     def on_save():
         img = state['nib_img']
-        default = 'segmentation.nii.gz'
+        default = os.path.join(state['dir'], 'segmentation.nii.gz')
         path, _ = QFileDialog.getSaveFileName(
             viewer, 'Save Segmentation', default, 'NIfTI (*.nii.gz *.nii)')
         if path:
