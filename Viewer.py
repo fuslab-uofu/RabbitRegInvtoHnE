@@ -9,7 +9,7 @@ from matplotlib.figure import Figure
 class VolumeViewer(QMainWindow):
     def __init__(self, data1, data2, title='3D Volume Slicer', seed_callback=None,
                  undo_callback=None, cut_callback=None, expand_to_max_callback=None,
-                 save_callback=None):
+                 save_callback=None, load_callback=None):
         super().__init__()
         self.data1 = data1
         self.data2 = data2
@@ -25,6 +25,7 @@ class VolumeViewer(QMainWindow):
         self.cut_callback = cut_callback
         self.expand_to_max_callback = expand_to_max_callback
         self.save_callback = save_callback
+        self.load_callback = load_callback
         self._cut_mode = False
         self.setMouseTracking(True)
         self.setWindowTitle(title)
@@ -70,6 +71,11 @@ class VolumeViewer(QMainWindow):
 
         if self.seed_callback is not None:
             self.canvas.mpl_connect('button_press_event', self._on_click)
+
+        if self.load_callback is not None:
+            load_btn = QPushButton('Load Volume')
+            load_btn.clicked.connect(self.load_callback)
+            main_layout.addWidget(load_btn)
 
         if self.save_callback is not None:
             save_btn = QPushButton('Save Segmentation')
@@ -143,6 +149,21 @@ class VolumeViewer(QMainWindow):
         self.current_slice = value
         self.update_plot()
         self.slider_label.setText(f"Slice: {self.current_slice}/{self.depth - 1}")
+
+    def reset(self, data1, data2):
+        """Swap in a new volume and reset all slice/overlay state."""
+        self.data1 = data1
+        self.data2 = data2
+        self.slice_axis = int(np.argmin(data1.shape))
+        self.display_axes = [i for i in range(data1.ndim) if i != self.slice_axis]
+        self.depth = data1.shape[self.slice_axis]
+        self.current_slice = self.depth // 2
+        self.slider.setMaximum(self.depth - 1)
+        self.slider.setValue(self.current_slice)
+        self.slider_label.setText(f'Slice: {self.current_slice}/{self.depth - 1}')
+        if hasattr(self, '_expand_btn') and self._expand_btn.isChecked():
+            self._expand_btn.setChecked(False)
+        self.update_plot()
 
     def update_plot(self):
         sl = [slice(None)] * self.data1.ndim

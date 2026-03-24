@@ -1,7 +1,7 @@
 import numpy as np
 import nibabel as nib
 import pytest
-from AssessReg import segment_from_seeds, flatten_field, make_seg_nifti
+from Segment import segment_from_seeds, flatten_field, make_seg_nifti
 
 
 def make_arr():
