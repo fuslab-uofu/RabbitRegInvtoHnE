@@ -4,6 +4,7 @@ import nibabel as nib
 import numpy as np
 import SimpleITK as sitk
 from scipy.ndimage import label
+from skimage.graph import route_through_array
 from PyQt5.QtWidgets import QApplication, QFileDialog
 from Viewer import VolumeViewer
 
@@ -22,6 +23,16 @@ def segment_ablation(arr, pct_threshold=99.99):
     sizes = np.array([np.sum(labeled == i) for i in range(1, n + 1)])
     largest_label = np.argmax(sizes) + 1
     return labeled == largest_label
+
+
+def _fill_cube(mask, centre, radius):
+    """Set a cubic region of voxels in mask to True around centre (in-place)."""
+    cx, cy, cz = (int(round(c)) for c in centre)
+    r = radius
+    x0, x1 = max(0, cx - r), min(mask.shape[0], cx + r + 1)
+    y0, y1 = max(0, cy - r), min(mask.shape[1], cy + r + 1)
+    z0, z1 = max(0, cz - r), min(mask.shape[2], cz + r + 1)
+    mask[x0:x1, y0:y1, z0:z1] = True
 
 
 def _erase_cube(mask, centre, radius):
@@ -106,6 +117,20 @@ def flatten_field(arr, shrink_factor=4):
     return sitk.GetArrayFromImage(corrected)
 
 
+def bridge_path(arr, start, end, radius=1):
+    """Find the minimum cost path between start and end through bright voxels.
+
+    Cost is inverse intensity so bright regions are cheap to traverse.
+    Returns a boolean mask with the path dilated by radius set to True.
+    """
+    cost = 1.0 / (arr.astype(float) + 1e-6)
+    path, _ = route_through_array(cost, start, end, fully_connected=True)
+    bridge = np.zeros_like(arr, dtype=bool)
+    for pt in path:
+        _fill_cube(bridge, pt, radius)
+    return bridge
+
+
 def make_seg_nifti(mask, affine, header=None):
     """Create a uint8 NIfTI image from a boolean segmentation mask."""
     return nib.Nifti1Image(mask.astype(np.uint8), affine, header)
@@ -123,6 +148,7 @@ if __name__ == '__main__':
     state = {'arr': None, 'nib_img': None, 'mask': None, 'dir': ''}
     seeds = []
     cuts = []
+    bridges = []      # list of boolean mask arrays, one per bridge
     action_log = []
 
     def _load_nifti(path):
@@ -138,16 +164,19 @@ if __name__ == '__main__':
         state['dir'] = os.path.dirname(os.path.abspath(path))
 
     def _reset_session():
-        """Clear all seeds, cuts, and mask for a fresh segmentation."""
+        """Clear all seeds, cuts, bridges, and mask for a fresh segmentation."""
         seeds.clear()
         cuts.clear()
+        bridges.clear()
         action_log.clear()
         state['mask'][:] = False
 
     def _resegment():
         hi = float(np.max(state['arr'])) if viewer.expand_to_max else None
-        state['mask'][:] = segment_from_seeds(
-            state['arr'], seeds, cuts=cuts, hi_bound=hi)
+        seg = segment_from_seeds(state['arr'], seeds, cuts=cuts, hi_bound=hi)
+        for b in bridges:
+            seg |= b
+        state['mask'][:] = seg
         viewer.data2 = state['mask'].astype(float) * 255
         viewer.update_plot()
 
@@ -167,6 +196,15 @@ if __name__ == '__main__':
         print(f'Cut ({x},{y},{z}) radius={r} — {len(cuts)} cuts')
         _resegment()
 
+    def on_bridge(start, end):
+        r = viewer.cut_radius
+        print(f'Bridging {start} → {end} radius={r}...')
+        b = bridge_path(state['arr'], start, end, radius=r)
+        bridges.append(b)
+        action_log.append('bridge')
+        print('Done.')
+        _resegment()
+
     def on_undo():
         if not action_log:
             return
@@ -177,6 +215,9 @@ if __name__ == '__main__':
         elif action == 'cut' and cuts:
             cuts.pop()
             print(f'Removed last cut, {len(cuts)} remaining')
+        elif action == 'bridge' and bridges:
+            bridges.pop()
+            print(f'Removed last bridge, {len(bridges)} remaining')
         _resegment()
 
     def on_save():
@@ -212,6 +253,7 @@ if __name__ == '__main__':
         seed_callback=on_click,
         undo_callback=on_undo,
         cut_callback=on_cut,
+        bridge_callback=on_bridge,
         expand_to_max_callback=_resegment,
         save_callback=on_save,
         load_callback=on_load,

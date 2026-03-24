@@ -8,8 +8,8 @@ from matplotlib.figure import Figure
 
 class VolumeViewer(QMainWindow):
     def __init__(self, data1, data2, title='3D Volume Slicer', seed_callback=None,
-                 undo_callback=None, cut_callback=None, expand_to_max_callback=None,
-                 save_callback=None, load_callback=None):
+                 undo_callback=None, cut_callback=None, bridge_callback=None,
+                 expand_to_max_callback=None, save_callback=None, load_callback=None):
         super().__init__()
         self.data1 = data1
         self.data2 = data2
@@ -23,10 +23,13 @@ class VolumeViewer(QMainWindow):
         self.seed_callback = seed_callback
         self.undo_callback = undo_callback
         self.cut_callback = cut_callback
+        self.bridge_callback = bridge_callback
         self.expand_to_max_callback = expand_to_max_callback
         self.save_callback = save_callback
         self.load_callback = load_callback
         self._cut_mode = False
+        self._bridge_mode = False
+        self._bridge_start = None
         self.setMouseTracking(True)
         self.setWindowTitle(title)
         self.initUI()
@@ -49,8 +52,8 @@ class VolumeViewer(QMainWindow):
         btn_panel = QWidget()
         btn_panel.setFixedWidth(160)
         btn_layout = QVBoxLayout(btn_panel)
-        btn_layout.setAlignment(Qt.AlignTop)
         btn_layout.setSpacing(6)
+        btn_layout.addStretch()
 
         if self.load_callback is not None:
             load_btn = QPushButton('Load Volume')
@@ -92,6 +95,14 @@ class VolumeViewer(QMainWindow):
             self._cut_radius_slider.valueChanged.connect(self._cut_radius_changed)
             btn_layout.addWidget(self._cut_radius_slider)
 
+        if self.bridge_callback is not None:
+            self._bridge_btn = QPushButton('Bridge Mode: OFF')
+            self._bridge_btn.setCheckable(True)
+            self._bridge_btn.setStyleSheet('QPushButton:checked { background-color: #27ae60; color: white; }')
+            self._bridge_btn.toggled.connect(self._toggle_bridge_mode)
+            btn_layout.addWidget(self._bridge_btn)
+
+        btn_layout.addStretch()
         top_layout.addWidget(btn_panel)
         main_layout.addLayout(top_layout)
 
@@ -134,6 +145,12 @@ class VolumeViewer(QMainWindow):
         self._cut_mode = checked
         self._cut_btn.setText('Cut Mode: ON' if checked else 'Cut Mode: OFF')
 
+    def _toggle_bridge_mode(self, checked):
+        self._bridge_mode = checked
+        self._bridge_start = None   # clear any pending first click
+        self._bridge_btn.setText('Bridge Mode: ON' if checked else 'Bridge Mode: OFF')
+        self.update_plot()
+
     def _cut_radius_changed(self, value):
         self.cut_radius = value
         self._cut_radius_label.setText(f'Cut Radius: {value}')
@@ -146,7 +163,16 @@ class VolumeViewer(QMainWindow):
         coords[self.display_axes[0]] = int(round(event.ydata))
         coords[self.display_axes[1]] = int(round(event.xdata))
         coords[self.slice_axis] = self.current_slice
-        if self._cut_mode and self.cut_callback is not None:
+        coords = tuple(coords)
+        if self._bridge_mode and self.bridge_callback is not None:
+            if self._bridge_start is None:
+                self._bridge_start = coords
+                self.update_plot()   # draw the pending-start marker
+            else:
+                start = self._bridge_start
+                self._bridge_start = None
+                self.bridge_callback(start, coords)
+        elif self._cut_mode and self.cut_callback is not None:
             self.cut_callback(*coords)
         elif self.seed_callback is not None:
             self.seed_callback(*coords)
@@ -182,6 +208,10 @@ class VolumeViewer(QMainWindow):
         self.ax.clear()
         self.ax.imshow(self.data1[tuple(sl)], vmin=0, vmax=255, cmap='viridis', origin='lower')
         self.ax.imshow(self.data2[tuple(sl)], vmin=0, vmax=255, alpha=self.opacity, cmap='viridis', origin='lower')
+        if self._bridge_start is not None and self._bridge_start[self.slice_axis] == self.current_slice:
+            disp_x = self._bridge_start[self.display_axes[1]]
+            disp_y = self._bridge_start[self.display_axes[0]]
+            self.ax.plot(disp_x, disp_y, 'g+', markersize=18, markeredgewidth=2)
         self.ax.set_title(f"Axis-{self.slice_axis} Slice {self.current_slice}")
         self.ax.set_xlabel(f"Axis {self.display_axes[1]}")
         self.ax.set_ylabel(f"Axis {self.display_axes[0]}")

@@ -1,7 +1,7 @@
 import numpy as np
 import nibabel as nib
 import pytest
-from Segment import segment_from_seeds, flatten_field, make_seg_nifti
+from Segment import segment_from_seeds, flatten_field, make_seg_nifti, bridge_path
 
 
 def make_arr():
@@ -173,6 +173,45 @@ def test_hi_bound_still_respects_connectivity():
     assert result[0, 0, 0]      # blob-A kept
     assert not result[0, 0, 1]  # gap (intensity 1 < lo=5) breaks connection
     assert not result[0, 0, 2]  # blob-B disconnected even though in range
+
+
+# --- bridge_path tests ---
+
+def test_bridge_path_output_shape_matches():
+    arr = np.ones((10, 10, 10))
+    result = bridge_path(arr, (0, 0, 0), (9, 9, 9), radius=0)
+    assert result.shape == arr.shape
+
+
+def test_bridge_path_includes_endpoints():
+    arr = np.ones((5, 5, 5))
+    result = bridge_path(arr, (0, 0, 0), (4, 4, 4), radius=0)
+    assert result[0, 0, 0]
+    assert result[4, 4, 4]
+
+
+def test_bridge_path_prefers_bright_voxels():
+    # Two routes between (0,0,0) and (0,0,4):
+    # - through row x=0 (dim, intensity=1)
+    # - through row x=1 (bright, intensity=100) then back
+    # With fully_connected=True the bright detour should be preferred
+    arr = np.ones((3, 1, 5))
+    arr[1, 0, :] = 100.0          # bright middle row
+    result = bridge_path(arr, (0, 0, 0), (0, 0, 4), radius=0)
+    assert np.any(result[1, 0, :])  # path went through bright row
+
+
+def test_bridge_path_radius_expands_path():
+    arr = np.ones((10, 10, 10))
+    r0 = bridge_path(arr, (5, 5, 0), (5, 5, 9), radius=0)
+    r1 = bridge_path(arr, (5, 5, 0), (5, 5, 9), radius=1)
+    assert r1.sum() > r0.sum()
+
+
+def test_bridge_path_output_dtype_is_bool():
+    arr = np.ones((5, 5, 5))
+    result = bridge_path(arr, (0, 0, 0), (4, 4, 4), radius=0)
+    assert result.dtype == bool
 
 
 # --- make_seg_nifti tests ---
