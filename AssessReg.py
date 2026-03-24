@@ -1,10 +1,9 @@
 import sys
 import nibabel as nib
 import numpy as np
-from scipy.ndimage import label, center_of_mass, binary_dilation
-from scipy.spatial import Delaunay
-from skimage.filters import threshold_otsu
-from PyQt5.QtWidgets import QApplication
+import SimpleITK as sitk
+from scipy.ndimage import label
+from PyQt5.QtWidgets import QApplication, QFileDialog
 from Viewer import VolumeViewer
 
 
@@ -24,145 +23,40 @@ def segment_ablation(arr, pct_threshold=99.99):
     return labeled == largest_label
 
 
-def segment_from_seed(arr, seed, roi_halfwidth=40, intensity_fraction=0.75):
-    """Segment the ablation using a user-provided seed point.
+def _erase_cube(mask, centre, radius):
+    """Zero out a cubic region of voxels in mask around centre (in-place)."""
+    cx, cy, cz = (int(round(c)) for c in centre)
+    r = radius
+    x0, x1 = max(0, cx - r), min(mask.shape[0], cx + r + 1)
+    y0, y1 = max(0, cy - r), min(mask.shape[1], cy + r + 1)
+    z0, z1 = max(0, cz - r), min(mask.shape[2], cz + r + 1)
+    mask[x0:x1, y0:y1, z0:z1] = False
 
-    Thresholds a local ROI at a fraction of the seed voxel's intensity, so the
-    threshold auto-calibrates to wherever the user clicks rather than relying on
-    global statistics. Returns the connected component at or nearest to the seed.
 
-    If the seed lands in a dark region (e.g. inside the ablation rather than on
-    the bright shell), it snaps to the nearest bright voxel in the ROI first.
+def segment_from_seeds(arr, seeds, cuts=None, hi_bound=None):
+    """Segment ablation by intensity range defined by multiple seed points.
+
+    Thresholds to [min_seed, hi_bound] where hi_bound defaults to max seed
+    intensity. Optionally erases cubes around cut points (each cut is a
+    (x, y, z, radius) tuple) to sever connections, then keeps only connected
+    components containing a seed point.
     """
-    seed = tuple(int(round(s)) for s in seed)
-
-    roi_slices = tuple(
-        slice(max(0, seed[i] - roi_halfwidth), min(arr.shape[i], seed[i] + roi_halfwidth))
-        for i in range(3)
-    )
-    roi = arr[roi_slices]
-    seed_in_roi = tuple(seed[i] - roi_slices[i].start for i in range(3))
-
-    seed_val = roi[seed_in_roi]
-
-    # If seed is in a dark region, snap to the nearest tissue-level voxel
-    if seed_val < threshold_otsu(roi):
-        bright_for_snap = roi >= threshold_otsu(roi)
-        bright_coords = np.array(np.where(bright_for_snap)).T
-        if len(bright_coords) == 0:
-            return np.zeros_like(arr, dtype=bool)
-        dists = np.linalg.norm(bright_coords - np.array(seed_in_roi), axis=1)
-        nearest = bright_coords[np.argmin(dists)]
-        seed_val = roi[tuple(nearest)]
-        seed_in_roi = tuple(nearest)
-
-    # Find voxels with similar brightness to the seed
-    bright = roi >= seed_val * intensity_fraction
-
-    labeled, n = label(bright)
-    if n == 0:
+    if not seeds:
         return np.zeros_like(arr, dtype=bool)
-
-    seed_label = labeled[seed_in_roi]
-
-    full_mask = np.zeros_like(arr, dtype=bool)
-    full_mask[roi_slices] = labeled == seed_label
-    return full_mask
-
-
-def segment_from_seed_gradient(arr, seed, roi_halfwidth=60, shell_search_radius=20):
-    """Segment the ablation zone using gradient magnitude from a seed inside the ablation.
-
-    Computes gradient magnitude in a local ROI (np.gradient uses centered differences).
-    The ablation shell appears as a ring of high gradient magnitude with two faces:
-    an inner wall (dark→bright transition) and an outer wall (bright→dark).
-
-    Steps:
-    1. Find the edge component nearest to the seed (inner wall).
-    2. Dilate that component by shell_search_radius to span the shell thickness
-       and capture the outer wall too.
-    3. Collect all edge voxels within the dilated region → full shell boundary.
-    4. Return the convex hull of those boundary points as the ablation zone.
-
-    shell_search_radius: dilation in voxels to bridge inner→outer wall. At 0.25 mm/voxel,
-    20 voxels = 5 mm, which covers a shell up to ~4 mm thick.
-    """
-    seed = tuple(int(round(s)) for s in seed)
-
-    roi_slices = tuple(
-        slice(max(0, seed[i] - roi_halfwidth), min(arr.shape[i], seed[i] + roi_halfwidth))
-        for i in range(3)
-    )
-    roi = arr[roi_slices]
-    seed_in_roi = tuple(seed[i] - roi_slices[i].start for i in range(3))
-
-    # Gradient magnitude: high at the ablation shell boundary
-    grads = np.gradient(roi)
-    grad_mag = np.sqrt(sum(g**2 for g in grads))
-
-    # Otsu threshold separates edge voxels (high gradient) from flat regions
-    thresh = threshold_otsu(grad_mag)
-    edge_mask = grad_mag >= thresh
-
-    if not np.any(edge_mask):
-        return np.zeros_like(arr, dtype=bool)
-
-    # Find the edge component nearest to the seed (inner wall of ablation shell)
-    labeled, _ = label(edge_mask)
-    edge_coords = np.column_stack(np.where(edge_mask))
-    dists = np.linalg.norm(edge_coords - np.array(seed_in_roi), axis=1)
-    nearest_label = labeled[tuple(edge_coords[np.argmin(dists)])]
-    inner_wall = labeled == nearest_label
-
-    # Dilate the inner wall to span the shell thickness and capture the outer wall
-    dilated = binary_dilation(inner_wall, iterations=shell_search_radius)
-
-    # Collect edge voxels within the dilated region — these form the full shell boundary
-    shell_coords = edge_coords[dilated[tuple(edge_coords.T)]].astype(float)
-
-    if len(shell_coords) < 4:
-        return np.zeros_like(arr, dtype=bool)
-
-    # Convex hull of the shell defines the full ablation zone (interior + shell)
-    try:
-        hull = Delaunay(shell_coords)
-    except Exception:
-        return np.zeros_like(arr, dtype=bool)
-
-    lo = np.maximum(0, shell_coords.min(axis=0).astype(int))
-    hi = np.minimum(np.array(roi.shape) - 1, shell_coords.max(axis=0).astype(int) + 1)
-    x = np.arange(lo[0], hi[0] + 1)
-    y = np.arange(lo[1], hi[1] + 1)
-    z = np.arange(lo[2], hi[2] + 1)
-    xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
-    voxels = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=1).astype(float)
-
-    in_hull = hull.find_simplex(voxels) >= 0
-    coords_in = voxels[in_hull].astype(int)
-
-    roi_mask = np.zeros(roi.shape, dtype=bool)
-    roi_mask[coords_in[:, 0], coords_in[:, 1], coords_in[:, 2]] = True
-
-    full_mask = np.zeros_like(arr, dtype=bool)
-    full_mask[roi_slices] = roi_mask
-    return full_mask
-
-
-def compute_dsc(mask1, mask2):
-    """Dice Similarity Coefficient between two binary masks. Returns 0.0-1.0."""
-    intersection = np.sum(mask1 & mask2)
-    total = np.sum(mask1) + np.sum(mask2)
-    if total == 0:
-        return 1.0
-    return 2.0 * intersection / total
-
-
-def compute_centroid_distance_mm(mask1, mask2, zooms):
-    """Euclidean distance in mm between centroids of two binary masks."""
-    c1 = np.array(center_of_mass(mask1)) * np.array(zooms)
-    c2 = np.array(center_of_mass(mask2)) * np.array(zooms)
-    return float(np.linalg.norm(c1 - c2))
-
+    seeds = [tuple(int(round(c)) for c in s) for s in seeds]
+    intensities = [arr[s] for s in seeds]
+    lo = min(intensities)
+    hi = hi_bound if hi_bound is not None else max(intensities)
+    threshold_mask = (arr >= lo) & (arr <= hi)
+    if cuts:
+        for cx, cy, cz, r in cuts:
+            _erase_cube(threshold_mask, (cx, cy, cz), r)
+    labeled, _ = label(threshold_mask)
+    seed_labels = {labeled[s] for s in seeds if labeled[s] > 0}
+    result = np.zeros_like(arr, dtype=bool)
+    for lbl in seed_labels:
+        result |= (labeled == lbl)
+    return result
 
 def assess_stage(registered_path, fixed_path, pct_threshold=90):
     """Assess registration quality for one stage using the ablation region.
@@ -186,19 +80,34 @@ def assess_stage(registered_path, fixed_path, pct_threshold=90):
     reg_mask = segment_ablation(reg_arr, pct_threshold)
     fixed_mask = segment_ablation(fixed_arr, pct_threshold)
 
-    dsc = compute_dsc(reg_mask, fixed_mask)
-    centroid_dist_mm = compute_centroid_distance_mm(reg_mask, fixed_mask, zooms)
-
     return {
-        'dsc': dsc,
-        'centroid_distance_mm': centroid_dist_mm,
-        'ablation_volume_registered_mm3': float(np.sum(reg_mask)) * vox_vol_mm3,
-        'ablation_volume_fixed_mm3': float(np.sum(fixed_mask)) * vox_vol_mm3,
         'reg_arr': reg_arr,
         'fixed_arr': fixed_arr,
         'reg_mask': reg_mask,
         'fixed_mask': fixed_mask,
     }
+
+
+def flatten_field(arr, shrink_factor=4):
+    """Apply N4 bias field correction to remove slow-varying intensity non-uniformity.
+
+    Computes N4 on a downsampled image for speed, then projects the bias field
+    back to full resolution before dividing out.
+    """
+    sitk_img = sitk.GetImageFromArray(arr.astype(np.float32))
+    # Clamp per-dimension so no axis shrinks below 2 voxels
+    safe_factors = [min(shrink_factor, max(1, d // 2)) for d in sitk_img.GetSize()]
+    shrunken = sitk.Shrink(sitk_img, safe_factors)
+    corrector = sitk.N4BiasFieldCorrectionImageFilter()
+    corrector.Execute(shrunken)
+    log_bias = corrector.GetLogBiasFieldAsImage(sitk_img)
+    corrected = sitk_img / sitk.Exp(log_bias)
+    return sitk.GetArrayFromImage(corrected)
+
+
+def make_seg_nifti(mask, affine, header=None):
+    """Create a uint8 NIfTI image from a boolean segmentation mask."""
+    return nib.Nifti1Image(mask.astype(np.uint8), affine, header)
 
 
 def norm255(arr):
@@ -218,38 +127,114 @@ if __name__ == '__main__':
     fixed_arr = fixed_can.get_fdata()
     zooms = fixed_can.header.get_zooms()
 
+    print('Applying N4 bias field correction...')
+    reg_arr = flatten_field(reg_arr)
+    fixed_arr = flatten_field(fixed_arr)
+    print('Done.')
+
+    reg_seeds = []
+    reg_cuts = []
+    reg_action_log = []   # 'seed' or 'cut' entries in placement order
+    fixed_seeds = []
+    fixed_cuts = []
+    fixed_action_log = []
     reg_mask = np.zeros_like(reg_arr, dtype=bool)
     fixed_mask = np.zeros_like(fixed_arr, dtype=bool)
 
-    def on_reg_click(x, y, z):
-        print(f'Registered image seed: ({x}, {y}, {z}) — segmenting...')
-        reg_mask[:] = segment_from_seed_gradient(reg_arr, (x, y, z))
-        print(f'  Ablation zone: {np.sum(reg_mask) * float(np.prod(zooms)):.1f} mm3')
-        viewer_reg.data2 = reg_mask * 255
+    def _resegment_reg():
+        hi = float(np.max(reg_arr)) if viewer_reg.expand_to_max else None
+        reg_mask[:] = segment_from_seeds(reg_arr, reg_seeds, cuts=reg_cuts, hi_bound=hi)
+        viewer_reg.data2 = reg_mask.astype(float) * 255
         viewer_reg.update_plot()
 
-    def on_fixed_click(x, y, z):
-        print(f'Fixed image seed: ({x}, {y}, {z}) — segmenting...')
-        fixed_mask[:] = segment_from_seed_gradient(fixed_arr, (x, y, z))
-        vox_vol = float(np.prod(zooms))
-        dsc = compute_dsc(reg_mask, fixed_mask)
-        dist = compute_centroid_distance_mm(reg_mask, fixed_mask, zooms)
-        print('Registration assessment:')
-        print(f'  DSC:                          {dsc:.4f}')
-        print(f'  Centroid distance:            {dist:.2f} mm')
-        print(f'  Ablation volume (registered): {np.sum(reg_mask) * vox_vol:.1f} mm3')
-        print(f'  Ablation volume (fixed):      {np.sum(fixed_mask) * vox_vol:.1f} mm3')
-        viewer_fixed.data2 = fixed_mask * 255
+    def _resegment_fixed():
+        hi = float(np.max(fixed_arr)) if viewer_fixed.expand_to_max else None
+        fixed_mask[:] = segment_from_seeds(fixed_arr, fixed_seeds, cuts=fixed_cuts, hi_bound=hi)
+        viewer_fixed.data2 = fixed_mask.astype(float) * 255
         viewer_fixed.update_plot()
+
+    def on_reg_click(x, y, z):
+        reg_seeds.append((x, y, z))
+        reg_action_log.append('seed')
+        intensities = [reg_arr[s] for s in reg_seeds]
+        print(f'Registered seed ({x},{y},{z}) intensity={reg_arr[x,y,z]:.1f} — range [{min(intensities):.1f}, {max(intensities):.1f}] ({len(reg_seeds)} seeds)')
+        _resegment_reg()
+
+    def on_reg_cut(x, y, z):
+        r = viewer_reg.cut_radius
+        reg_cuts.append((x, y, z, r))
+        reg_action_log.append('cut')
+        print(f'Registered cut ({x},{y},{z}) radius={r} — {len(reg_cuts)} cuts')
+        _resegment_reg()
+
+    def on_reg_undo():
+        if not reg_action_log:
+            return
+        action = reg_action_log.pop()
+        if action == 'seed' and reg_seeds:
+            reg_seeds.pop()
+            print(f'Registered: removed last seed, {len(reg_seeds)} remaining')
+        elif action == 'cut' and reg_cuts:
+            reg_cuts.pop()
+            print(f'Registered: removed last cut, {len(reg_cuts)} remaining')
+        _resegment_reg()
+
+    def on_fixed_click(x, y, z):
+        fixed_seeds.append((x, y, z))
+        fixed_action_log.append('seed')
+        intensities = [fixed_arr[s] for s in fixed_seeds]
+        print(f'Fixed seed ({x},{y},{z}) intensity={fixed_arr[x,y,z]:.1f} — range [{min(intensities):.1f}, {max(intensities):.1f}] ({len(fixed_seeds)} seeds)')
+        _resegment_fixed()
+
+    def on_fixed_cut(x, y, z):
+        r = viewer_fixed.cut_radius
+        fixed_cuts.append((x, y, z, r))
+        fixed_action_log.append('cut')
+        print(f'Fixed cut ({x},{y},{z}) radius={r} — {len(fixed_cuts)} cuts')
+        _resegment_fixed()
+
+    def on_fixed_undo():
+        if not fixed_action_log:
+            return
+        action = fixed_action_log.pop()
+        if action == 'seed' and fixed_seeds:
+            fixed_seeds.pop()
+            print(f'Fixed: removed last seed, {len(fixed_seeds)} remaining')
+        elif action == 'cut' and fixed_cuts:
+            fixed_cuts.pop()
+            print(f'Fixed: removed last cut, {len(fixed_cuts)} remaining')
+        _resegment_fixed()
+
+    def on_reg_save():
+        path, _ = QFileDialog.getSaveFileName(
+            viewer_reg, 'Save Registered Segmentation', 'reg_segmentation.nii.gz',
+            'NIfTI (*.nii.gz *.nii)')
+        if path:
+            nib.save(make_seg_nifti(reg_mask, reg_img.affine, reg_img.header), path)
+            print(f'Saved: {path}')
+
+    def on_fixed_save():
+        path, _ = QFileDialog.getSaveFileName(
+            viewer_fixed, 'Save Fixed Segmentation', 'fixed_segmentation.nii.gz',
+            'NIfTI (*.nii.gz *.nii)')
+        if path:
+            nib.save(make_seg_nifti(fixed_mask, fixed_can.affine, fixed_can.header), path)
+            print(f'Saved: {path}')
 
     app = QApplication(sys.argv)
     viewer_reg = VolumeViewer(norm255(reg_arr), np.zeros_like(reg_arr),
                               'Registered InVivo — click inside ablation to seed',
-                              seed_callback=on_reg_click)
+                              seed_callback=on_reg_click, undo_callback=on_reg_undo,
+                              cut_callback=on_reg_cut,
+                              expand_to_max_callback=_resegment_reg,
+                              save_callback=on_reg_save)
     viewer_reg.show()
     viewer_fixed = VolumeViewer(norm255(fixed_arr), np.zeros_like(fixed_arr),
                                 'Fixed ExVivo — click inside ablation to seed',
-                                seed_callback=on_fixed_click)
+                                seed_callback=on_fixed_click, undo_callback=on_fixed_undo,
+                                cut_callback=on_fixed_cut,
+                                expand_to_max_callback=_resegment_fixed,
+                                save_callback=on_fixed_save)
     viewer_fixed.move(820, 100)
     viewer_fixed.show()
     sys.exit(app.exec_())
