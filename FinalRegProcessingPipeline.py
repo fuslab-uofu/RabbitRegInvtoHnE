@@ -66,7 +66,7 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed):
 
     return current_volume, current_affine
 
-MultiStepReg("R23-055", 6, '/Users/jbonaventura/Downloads/RabbitData', "InVivo", "BlockFace")
+MultiStepReg("R23-055", Block, '/Users/jbonaventura/Downloads/RabbitData', "InVivo", "BlockFace")
 
 #Buggy- needs work before implementation
 # resampled=compose_e_resample(SlicerTPath, dfieldpath, fixed_image, moving_image)
