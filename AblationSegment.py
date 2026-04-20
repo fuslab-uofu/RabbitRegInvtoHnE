@@ -35,14 +35,17 @@ def _fill_cube(mask, centre, radius):
     mask[x0:x1, y0:y1, z0:z1] = True
 
 
-def _erase_cube(mask, centre, radius):
-    """Zero out a cubic region of voxels in mask around centre (in-place)."""
-    cx, cy, cz = (int(round(c)) for c in centre)
-    r = radius
-    x0, x1 = max(0, cx - r), min(mask.shape[0], cx + r + 1)
-    y0, y1 = max(0, cy - r), min(mask.shape[1], cy + r + 1)
-    z0, z1 = max(0, cz - r), min(mask.shape[2], cz + r + 1)
-    mask[x0:x1, y0:y1, z0:z1] = False
+def _erase_cube(mask, centre, radius, slice_axis, z_radius=1):
+    """Zero out a region of voxels in mask around centre (in-place).
+
+    radius applies to the two in-plane axes; z_radius controls depth along slice_axis.
+    """
+    centre = tuple(int(round(c)) for c in centre)
+    slices = []
+    for ax in range(mask.ndim):
+        r = z_radius if ax == slice_axis else radius
+        slices.append(slice(max(0, centre[ax] - r), min(mask.shape[ax], centre[ax] + r + 1)))
+    mask[tuple(slices)] = False
 
 
 def segment_from_seeds(arr, seeds, cuts=None, hi_bound=None):
@@ -61,8 +64,8 @@ def segment_from_seeds(arr, seeds, cuts=None, hi_bound=None):
     hi = hi_bound if hi_bound is not None else max(intensities)
     threshold_mask = (arr >= lo) & (arr <= hi)
     if cuts:
-        for cx, cy, cz, r in cuts:
-            _erase_cube(threshold_mask, (cx, cy, cz), r)
+        for cx, cy, cz, r, slice_axis in cuts:
+            _erase_cube(threshold_mask, (cx, cy, cz), r, slice_axis)
     labeled, _ = label(threshold_mask)
     seed_labels = {labeled[s] for s in seeds if labeled[s] > 0}
     result = np.zeros_like(arr, dtype=bool)
@@ -191,18 +194,21 @@ if __name__ == '__main__':
 
     def on_cut(x, y, z):
         r = viewer.cut_radius
-        cuts.append((x, y, z, r))
+        cuts.append((x, y, z, r, viewer.slice_axis))
         action_log.append('cut')
-        print(f'Cut ({x},{y},{z}) radius={r} — {len(cuts)} cuts')
+        print(f'Cut ({x},{y},{z}) radius={r} slice_axis={viewer.slice_axis} — {len(cuts)} cuts')
         _resegment()
 
     def on_bridge(start, end):
-        r = viewer.cut_radius
+        r = viewer.bridge_radius
         print(f'Bridging {start} → {end} radius={r}...')
         b = bridge_path(state['arr'], start, end, radius=r)
+        n_total = int(b.sum())
+        slices_hit = np.where(b.any(axis=tuple(viewer.display_axes)))[0]
+        print(f'Bridge: {n_total} voxels across slices {slices_hit[[0, -1]].tolist()} '
+              f'(currently viewing slice {viewer.current_slice})')
         bridges.append(b)
         action_log.append('bridge')
-        print('Done.')
         _resegment()
 
     def on_undo():

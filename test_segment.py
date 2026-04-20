@@ -1,7 +1,7 @@
 import numpy as np
 import nibabel as nib
 import pytest
-from Segment import segment_from_seeds, flatten_field, make_seg_nifti, bridge_path
+from AblationSegment import segment_from_seeds, flatten_field, make_seg_nifti, bridge_path
 
 
 def make_arr():

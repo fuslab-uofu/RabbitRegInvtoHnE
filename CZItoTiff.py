@@ -66,8 +66,8 @@ for file in os.listdir(czi_dirpath):
         plt.show()
 
         #Save Image as Tiff-
-        new_file_path = os.path.join(save_dirpath, "HnE_IMG_"+ image_tag + ".tif")
-        CImage = Image.fromarray(czi_img)
-        CImage.save(new_file_path, 'TIFF')
+        # new_file_path = os.path.join(save_dirpath, "HnE_IMG_"+ image_tag + ".tif")
+        # CImage = Image.fromarray(czi_img)
+        # CImage.save(new_file_path, 'TIFF')
 
 

@@ -11,6 +11,14 @@ def find_nii(directory):
             return matches[0]
     return None
 
+def get_assess_data(parent_folder):
+    assess_folder = os.path.join(parent_folder, 'RegAssessData')
+    nifti_path = find_nii(assess_folder)
+    #Can add LMs as well here when we're ready
+    return nifti_path
+
+
+
 def find_all_the_paths(RabbitID, Block, pathtoRabbits, Moving):
     BlockID= "Block"+f"{Block:02d}"
     RabbitFolder= os.path.join(pathtoRabbits, RabbitID)
@@ -38,6 +46,7 @@ def find_all_the_paths(RabbitID, Block, pathtoRabbits, Moving):
 
     return {
         "Moving_FilePath": find_nii(moving_file_folder),
+        "Moving_Folder":   moving_file_folder,
         "Fixed_FilePath":  find_nii(fixed_file_folder),
         "Fixed_Folder":    fixed_file_folder,
         "RegFold":         os.path.join(moving_reg_folder, 'RegTransforms'),

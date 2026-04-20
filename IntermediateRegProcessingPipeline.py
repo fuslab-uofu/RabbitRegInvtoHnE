@@ -3,8 +3,8 @@ import os
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # required for network filesystems (ceph, NFS)
 import numpy as np
 import nibabel as nib
-from ApplyTranforms import *
-from RabbitPathFInder import *
+from ApplyTransforms import *
+from RabbitPathFinder import *
 from NiftyTransforms import makesegfromvol, match_histograms, bin_intensities, DimsDivFour
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -156,7 +156,7 @@ def MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder):
 
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R24-240"
-Block = 1
+RabbitID="R23-055"
+Block = 6
 
 MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder)

@@ -21,7 +21,7 @@ from scipy.linalg import solve
 from scipy.ndimage import map_coordinates
 
 import skimage as ski
-from tps import ThinPlateSpline
+#from tps import ThinPlateSpline
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -30,7 +30,7 @@ global sf1234
 sf1234=3
 
 #Can set default folder here to make finding files easier->
-DEFAULT_FOLDER = "/Users/jbonaventura/Downloads/RabbitData"
+DEFAULT_FOLDER = "/Users/jbonaventura/Downloads/RabbitData/R23-055"
 
 class ImageViewer(QDialog):
     def __init__(self, image):

@@ -7,7 +7,7 @@ import torch
 from scipy.ndimage import map_coordinates
 
 # Applying Deformation Field-
-def ApplyDfield(dfpath, movingvol):
+def ApplyDfield(dfpath, movingvol, order=0):
     # Load the warp field
     data = torch.load(dfpath, map_location='cpu')
     field = data['data'].numpy()
@@ -22,8 +22,8 @@ def ApplyDfield(dfpath, movingvol):
     field = field[:, :X, :Y, :Z]
     # Reorder channels from (Z, Y, X) to (X, Y, Z) for map_coordinates and subtract 1 to convert from 1-indexed to 0-indexed
     coords = [field[2] - 1, field[1] - 1, field[0] - 1]
-    # Resample
-    registered = map_coordinates(movingvol, coords, order=1, mode='constant', cval=0)
+    # Resample — order=0 nearest-neighbor preserves original voxel values; order=1 linear interpolates
+    registered = map_coordinates(movingvol, coords, order=order, mode='constant', cval=0)
     return(registered)
 
 def warn_if_oblique(nifti_path):
@@ -59,7 +59,7 @@ def nib_to_sitk(array, nib_affine):
     img.SetOrigin(lps_origin.tolist())
     return img
 
-def ApplySlicerTransform(moving, fixedimpath, SlicerTPath,  moving_affine=None):
+def ApplySlicerTransform(moving, fixedimpath, SlicerTPath, moving_affine=None, interpolator=sitk.sitkNearestNeighbor):
     fixed_image = sitk.ReadImage(fixedimpath)
     transform = sitk.ReadTransform(SlicerTPath)
     #Case #1- first reg step-
@@ -74,7 +74,7 @@ def ApplySlicerTransform(moving, fixedimpath, SlicerTPath,  moving_affine=None):
         moving_image,  # image to resample
         fixed_image,  # reference grid (defines output space)
         transform,  # the transform
-        sitk.sitkLinear,  # interpolation method
+        interpolator,  # interpolation method — sitkNearestNeighbor preserves values; sitkLinear interpolates
         0.0,  # default pixel value for voxels outside the moving image
         moving_image.GetPixelID()
     )

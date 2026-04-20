@@ -3,20 +3,20 @@ import os
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # required for network filesystems (ceph, NFS)
 import numpy as np
 import nibabel as nib
-from ApplyTranforms import *
-from RabbitPathFInder import *
+from ApplyTransforms import *
+from RabbitPathFinder import *
 from datetime import datetime
 import matplotlib.pyplot as plt
 import glob
 
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
-RabbitFolder='/Users/jbonaventura/Downloads/RabbitData'
+RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
 RabbitID="R23-055"
 Block = 6
 
 #Generalizing to be able to do multiple steps->
 #Provide key for moving and final fixed volume. Options- ["InVivo", "ExVivo", "ExVivoBlock", "Blockface"]
-def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed):
+def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpolation='nearest'):
     PROGRESSION = ["InVivo", "ExVivo", "ExVivoBlock", "BlockFace"]
 
     start_idx = PROGRESSION.index(MovingStart)
@@ -25,6 +25,11 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed):
     if end_idx <= start_idx:
         print("The two volumes selected are not fit for registration")
         return
+
+    # interpolation='nearest' preserves original voxel values across all resampling steps (recommended for voxel-level analysis)
+    # interpolation='linear' blends values at each step (smoother edges, but compounding blur across multiple steps)
+    sitk_interp  = sitk.sitkNearestNeighbor if interpolation == 'nearest' else sitk.sitkLinear
+    dfield_order = 0                         if interpolation == 'nearest' else 1
 
     current_volume = None
     current_affine = None
@@ -42,16 +47,16 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed):
         warn_if_oblique(paths['Fixed_FilePath'])
         if current_volume is None:
             warn_if_oblique(paths['Moving_FilePath'])
-            resampled = ApplySlicerTransform(str(paths['Moving_FilePath']), fixedimpath, str(SlicerTPath))
+            resampled = ApplySlicerTransform(str(paths['Moving_FilePath']), fixedimpath, str(SlicerTPath), interpolator=sitk_interp)
         else:
-            resampled = ApplySlicerTransform(current_volume, fixedimpath, str(SlicerTPath), moving_affine=current_affine)
+            resampled = ApplySlicerTransform(current_volume, fixedimpath, str(SlicerTPath), moving_affine=current_affine, interpolator=sitk_interp)
 
         # Canonicalize to match LandMarker's convention — field source coords index canonical space
         resampled = np.asanyarray(
             nib.as_closest_canonical(nib.Nifti1Image(resampled, fixed_nib.affine)).dataobj
         ).astype(np.float32)
 
-        current_volume = ApplyDfield(str(dfieldpath), resampled)
+        current_volume = ApplyDfield(str(dfieldpath), resampled, order=dfield_order)
         current_affine = fixed_nib_canonical.affine
 
     # Save result to the MovingStart stage's RegDataOut folder
@@ -59,13 +64,14 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed):
     save_paths  = find_all_the_paths(RabbitID, Block, RabbitFolder, MovingStart)
     output_dir  = save_paths['RegDataOut']
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"{MovingStart}RegTo{EndFixed}_{timestamp}.nii.gz")
+    end_label = EndFixed.replace("ExVivoBlock", f"ExVivoBlock{Block:02d}").replace("BlockFace", f"Block{Block:02d}")
+    output_path = os.path.join(output_dir, f"{MovingStart}RegTo{end_label}_{timestamp}.nii.gz")
     nib.save(nib.Nifti1Image(current_volume, current_affine), output_path)
     print(f"Saved to {output_path}")
 
     return current_volume, current_affine
 
-MultiStepReg("R23-055", 6, '/Users/jbonaventura/Downloads/RabbitData', "InVivo", "BlockFace")
+MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='nearest')
 
 #Buggy- needs work before implementation
 # resampled=compose_e_resample(SlicerTPath, dfieldpath, fixed_image, moving_image)

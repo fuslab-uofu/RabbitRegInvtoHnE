@@ -9,7 +9,8 @@ from matplotlib.figure import Figure
 class VolumeViewer(QMainWindow):
     def __init__(self, data1, data2, title='3D Volume Slicer', seed_callback=None,
                  undo_callback=None, cut_callback=None, bridge_callback=None,
-                 expand_to_max_callback=None, save_callback=None, load_callback=None):
+                 expand_to_max_callback=None, save_callback=None, load_callback=None,
+                 landmarks=None):
         super().__init__()
         self.data1 = data1
         self.data2 = data2
@@ -18,7 +19,9 @@ class VolumeViewer(QMainWindow):
         self.depth = data1.shape[self.slice_axis]
         self.current_slice = self.depth // 2
         self.opacity = 0
+        self.landmarks = landmarks or []
         self.cut_radius = 1
+        self.bridge_radius = 1
         self.expand_to_max = False
         self.seed_callback = seed_callback
         self.undo_callback = undo_callback
@@ -102,6 +105,17 @@ class VolumeViewer(QMainWindow):
             self._bridge_btn.toggled.connect(self._toggle_bridge_mode)
             btn_layout.addWidget(self._bridge_btn)
 
+            self._bridge_radius_label = QLabel(f'Bridge Radius: {self.bridge_radius}')
+            btn_layout.addWidget(self._bridge_radius_label)
+            self._bridge_radius_slider = QSlider(Qt.Horizontal)
+            self._bridge_radius_slider.setMinimum(0)
+            self._bridge_radius_slider.setMaximum(5)
+            self._bridge_radius_slider.setValue(self.bridge_radius)
+            self._bridge_radius_slider.setTickPosition(QSlider.TicksBelow)
+            self._bridge_radius_slider.setTickInterval(1)
+            self._bridge_radius_slider.valueChanged.connect(self._bridge_radius_changed)
+            btn_layout.addWidget(self._bridge_radius_slider)
+
         btn_layout.addStretch()
         top_layout.addWidget(btn_panel)
         main_layout.addLayout(top_layout)
@@ -154,6 +168,10 @@ class VolumeViewer(QMainWindow):
     def _cut_radius_changed(self, value):
         self.cut_radius = value
         self._cut_radius_label.setText(f'Cut Radius: {value}')
+
+    def _bridge_radius_changed(self, value):
+        self.bridge_radius = value
+        self._bridge_radius_label.setText(f'Bridge Radius: {value}')
 
     def _on_click(self, event):
         if event.inaxes != self.ax or event.xdata is None:
@@ -212,6 +230,33 @@ class VolumeViewer(QMainWindow):
             disp_x = self._bridge_start[self.display_axes[1]]
             disp_y = self._bridge_start[self.display_axes[0]]
             self.ax.plot(disp_x, disp_y, 'g+', markersize=18, markeredgewidth=2)
+        any_plotted = False
+        for lm_set in self.landmarks:
+            pts = lm_set['vox']
+            ids = lm_set.get('ids')
+            on_slice = np.abs(pts[:, self.slice_axis] - self.current_slice) <= 1
+            visible_pts = pts[on_slice]
+            visible_ids = [ids[i] for i in np.where(on_slice)[0]] if ids is not None else None
+            if len(visible_pts):
+                self.ax.scatter(
+                    visible_pts[:, self.display_axes[1]],
+                    visible_pts[:, self.display_axes[0]],
+                    c=lm_set.get('color', 'red'),
+                    marker=lm_set.get('marker', 'o'),
+                    s=80, zorder=5,
+                    label=lm_set.get('label', ''),
+                )
+                if visible_ids is not None:
+                    for pt, lid in zip(visible_pts, visible_ids):
+                        self.ax.annotate(
+                            str(lid),
+                            (pt[self.display_axes[1]], pt[self.display_axes[0]]),
+                            textcoords='offset points', xytext=(5, 5),
+                            fontsize=8, color=lm_set.get('color', 'red'), zorder=6,
+                        )
+                any_plotted = True
+        if any_plotted:
+            self.ax.legend(loc='upper right', fontsize=8)
         self.ax.set_title(f"Axis-{self.slice_axis} Slice {self.current_slice}")
         self.ax.set_xlabel(f"Axis {self.display_axes[1]}")
         self.ax.set_ylabel(f"Axis {self.display_axes[0]}")
