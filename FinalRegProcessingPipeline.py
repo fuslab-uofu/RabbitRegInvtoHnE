@@ -3,8 +3,8 @@ import os
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # required for network filesystems (ceph, NFS)
 import numpy as np
 import nibabel as nib
-from ApplyTranforms import *
-from RabbitPathFInder import *
+from ApplyTransforms import *
+from RabbitPathFinder import *
 from datetime import datetime
 import matplotlib.pyplot as plt
 import glob
@@ -59,7 +59,8 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed):
     save_paths  = find_all_the_paths(RabbitID, Block, RabbitFolder, MovingStart)
     output_dir  = save_paths['RegDataOut']
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"{MovingStart}RegTo{EndFixed}_{timestamp}.nii.gz")
+    end_label = EndFixed.replace("ExVivoBlock", f"ExVivoBlock{Block:02d}").replace("BlockFace", f"Block{Block:02d}")
+    output_path = os.path.join(output_dir, f"{MovingStart}RegTo{end_label}_{timestamp}.nii.gz")
     nib.save(nib.Nifti1Image(current_volume, current_affine), output_path)
     print(f"Saved to {output_path}")
 
