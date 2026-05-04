@@ -372,7 +372,7 @@ if __name__ == '__main__':
         mask = None
 
     show_tiles = True         # set True to visualize each tile during extraction
-    save_tile_overlays = False # set True to save tile-marked NIfTI copies for each Day3/Day0 vol
+    save_tile_overlays = True # set True to save tile-marked NIfTI copies for each Day3/Day0 vol
     extract_features = False  # set True to compute H&E/MR features and save CSV
     Extend_Thru_InVivo = True # propagate Tiles to other InVivo Spaces
 
