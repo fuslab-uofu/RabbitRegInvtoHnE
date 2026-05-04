@@ -12,7 +12,7 @@ import glob
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
 RabbitID="R23-055"
-Block = 6
+Block = 7
 
 #Generalizing to be able to do multiple steps->
 #Provide key for moving and final fixed volume. Options- ["InVivo", "ExVivo", "ExVivoBlock", "Blockface"]

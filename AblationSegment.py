@@ -35,15 +35,17 @@ def _fill_cube(mask, centre, radius):
     mask[x0:x1, y0:y1, z0:z1] = True
 
 
-def _erase_cube(mask, centre, radius, slice_axis, z_radius=1):
+def _erase_cube(mask, centre, radius, slice_axis=None, z_radius=1):
     """Zero out a region of voxels in mask around centre (in-place).
 
-    radius applies to the two in-plane axes; z_radius controls depth along slice_axis.
+    If slice_axis is given, radius applies to the two in-plane axes and z_radius
+    controls depth along slice_axis.  If slice_axis is None, radius applies to
+    all axes (symmetric cube removal).
     """
     centre = tuple(int(round(c)) for c in centre)
     slices = []
     for ax in range(mask.ndim):
-        r = z_radius if ax == slice_axis else radius
+        r = (z_radius if ax == slice_axis else radius) if slice_axis is not None else radius
         slices.append(slice(max(0, centre[ax] - r), min(mask.shape[ax], centre[ax] + r + 1)))
     mask[tuple(slices)] = False
 
@@ -64,7 +66,9 @@ def segment_from_seeds(arr, seeds, cuts=None, hi_bound=None):
     hi = hi_bound if hi_bound is not None else max(intensities)
     threshold_mask = (arr >= lo) & (arr <= hi)
     if cuts:
-        for cx, cy, cz, r, slice_axis in cuts:
+        for cut in cuts:
+            cx, cy, cz, r = cut[:4]
+            slice_axis = cut[4] if len(cut) > 4 else None
             _erase_cube(threshold_mask, (cx, cy, cz), r, slice_axis)
     labeled, _ = label(threshold_mask)
     seed_labels = {labeled[s] for s in seeds if labeled[s] > 0}

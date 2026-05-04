@@ -157,6 +157,6 @@ def MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder):
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
 RabbitID="R23-055"
-Block = 6
+Block = 7
 
 MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder)
