@@ -22,6 +22,8 @@ from skimage.measure import block_reduce
 import torch
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
+from RabbitPathFinder import find_day3_paths, find_day0_paths
+from ApplyTransforms import propagate_tiles_to_day0
 
 
 def ensure_ccw(corners):
@@ -356,7 +358,6 @@ if __name__ == '__main__':
     BlockFaceFolder = os.path.join(RabbitFolder, RabbitID, 'BlockFace_RGB', f'Block{Block:02d}')
     #reg_show_path    = os.path.join(BlockFaceFolder, 'greyscale_downsampled.nii.gz')
     reg_show_path = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/InVivo_MR/RegDataOut/InVivoRegToBlock07_0427-1855.nii.gz"
-    reg_show_path2 = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/InVivo_MR/RegDataOut/InVivoRegToBlock07_0428-1042.nii.gz"
     #Need- to determine proper slice in 3d volume-
     bf_cropped_dir  = os.path.join(BlockFaceFolder, 'CroppedImages')
     output_dir = '/Users/jbonaventura/Desktop/Annotations'
@@ -384,15 +385,6 @@ if __name__ == '__main__':
     if reg_show.affine[0, 0] > 0 and reg_show.affine[1, 1] > 0:
         reg_show_arr = reg_show_arr[::-1, ::-1, :]
 
-    #Real quick to compare iterp modes-    #Load in volume to show tiles on/from-
-    reg_show2 = nib.load(reg_show_path2)
-    reg_show2_affine = reg_show2.affine
-    reg_show2_arr = reg_show2.get_fdata()
-    #If canonical move over to blockface space for visualization->
-    if reg_show2.affine[0, 0] > 0 and reg_show2.affine[1, 1] > 0:
-        reg_show2_arr = reg_show2_arr[::-1, ::-1, :]
-
-
     _target_nib = nib.load(str(find_all_the_paths(RabbitID, Block, RabbitFolder, target_space)['Moving_FilePath']))
     target_arr  = _target_nib.get_fdata()
 
@@ -405,6 +397,7 @@ if __name__ == '__main__':
         img=5
         hne_ds_im= reg_HnE_arr[:,:,img,:]
 
+        #Finding tps transform between CZI and blockface->
         img_number = re.search(r'\d+', hne_filenames[img]).group()  # e.g. '0011'
         landmarks = load_landmarks(hne_base_dir, img_number)
         scale_fac=20 #scale factor between HnE raw and downsampled
@@ -428,26 +421,20 @@ if __name__ == '__main__':
         vol_upsampled = np.repeat(np.repeat(Show_Slice, 4, axis=0), 4, axis=1)
         Show_Slice_us= vol_upsampled[:hne_ds_im.shape[0],:hne_ds_im.shape[1]]
 
-        #rep to comp interps-
-        Show_Slice2 = reg_show2_arr[:,:,slice_num].T
-        #Upsampling by 4 this is for visualization and tile extraction purposes- not for analysis-
-        vol_upsampled2 = np.repeat(np.repeat(Show_Slice2, 4, axis=0), 4, axis=1)
-        Show_Slice_us2= vol_upsampled2[:hne_ds_im.shape[0],:hne_ds_im.shape[1]]
-
-
 
         origin_list = tiling_tool(reg_HnE_arr[:,:,img,:], tilesize)
         czifile = CziFile(CZI_filepath)
         bbox = czifile.get_mosaic_bounding_box()
+
+        #If we want to look at a downsampled CZI file- useful for verifying splines transform is acting how we want-
         # czi_patch = czifile.read_mosaic(C=0, scale_factor=1/10, region=(bbox.x, bbox.y, bbox.w, bbox.h))[0]
         # czi_patch[:, :, [0, 2]] = czi_patch[:, :, [2, 0]]  #Swap color channels for RGB vs BGR conventions
-
         #output_image = ski.transform.warp(hne_ds_im, splines_inv, output_shape=(czi_img.shape[0]*scale_fac, czi_img.shape[1]*scale_fac, czi_img.shape[2]))
         ## normalize and convert to uint8
         #output_image = (output_image / np.max(output_image) * 255).astype(np.uint8)
         # tformed_origins = splines(origin_list[:, ::-1])[:, ::-1]* 2
 
-
+        #Showing Tiles over slices in bf space->
         fig, axes = plt.subplots(1, 2)
         axes[0].imshow(hne_ds_im)
         for q in range(len(origin_list)):
@@ -474,7 +461,7 @@ if __name__ == '__main__':
             axes[1].add_patch(rect)
         plt.show()
 
-        # Build (N_tiles, 4, 2) corner array in [row, col] and propagate all tiles at once-
+        # Build (N_tiles, 4, 2) corner array in [row, col] and propagate all tiles at once to other spaces-
         rows = origin_list[:, 0]
         cols = origin_list[:, 1]
         all_corners = np.stack([
@@ -489,12 +476,9 @@ if __name__ == '__main__':
             all_corners, slice_num, RabbitID, Block, RabbitFolder, target_space
         )  # (N_tiles, 4, 3) raw voxel coords in target_space
 
-
         if target_space == "InVivo" and Extend_Thru_InVivo:
             day3_tile_corners = propagate_tiles_to_Invivo_spaces(target_corners, RabbitID, RabbitFolder, Block)
             if show_tiles or save_tile_overlays:
-                from RabbitPathFinder import find_day3_paths, find_day0_paths
-                from ApplyTransforms import propagate_tiles_to_day0
                 _d3 = find_day3_paths(RabbitID, RabbitFolder)
                 day3_arrs = {}
                 day3_affines = {}
@@ -625,9 +609,6 @@ if __name__ == '__main__':
             # #pull cooresponding tile from MRSlice->
             MR_Tile = Show_Slice_us[O_up[0]:O_up[0]+tilesize, O_up[1]:O_up[1]+tilesize]
 
-            MR_Tile2 = Show_Slice_us2[O_up[0]:O_up[0] + tilesize, O_up[1]:O_up[1] + tilesize]
-
-
             # Original approach: axis-aligned bounding box at mean z
             target_patch = target_arr[t_x0:t_x1, t_y0:t_y1, t_z]
 
@@ -689,7 +670,6 @@ if __name__ == '__main__':
 
                 tile_render_data.append({
                     'czi_patch': czi_patch,
-                    'MR_Tile2': MR_Tile2,
                     'target_patch_oblique': target_patch_oblique,
                     'vmin': vmin,
                     'vmax': vmax,

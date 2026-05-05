@@ -16,11 +16,12 @@ def load_files_pathlib(directory_path, name_pattern, file_type):
     return matching_files
 
 
-directory = '/Users/jbonaventura/Downloads/R23-292/BlockFaceRGB/block07'
+directory = '/System/Volumes/Data/ceph/hifu/animal_data/IACUC1800/R24-101/R24-101_BlockFaceImages/block09'
 files = load_files_pathlib(directory, 'scatter', '.jpg')
 
 # Define the path
-new_dir_path = Path(os.path.join(directory, "CroppedImages"))
+#new_dir_path = Path(os.path.join(directory, "CroppedImages"))
+new_dir_path = Path("/Users/jbonaventura/Desktop/r24101_croppedbf")
 
 # Create the directory and any necessary parents, suppressing errors if it exists
 new_dir_path.mkdir(parents=True, exist_ok=True)
@@ -35,7 +36,7 @@ for file_path in files:
     # Convert the Image object to a NumPy array
     img_array = np.array(img)
     #Change Crop region-
-    cropped_im=img_array[775:3300,1550:3400,:]
+    cropped_im=img_array[775:3300,1500:3400,:]
     # plt.imshow(cropped_im)
     # plt.show()
 
