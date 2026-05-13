@@ -99,9 +99,10 @@ if __name__ == '__main__':
     hne_base_dir = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/HnE/Block07'
     #Change here to change (Should work with any of the niftis registered to BlockFace-
     reg_HnE_dir = os.path.join(hne_base_dir, 'Registered')
-    reg_show = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/BlockFace_RGB/Block07/greyscale_downsampled.nii.gz'
+    reg_show = '/Users/jbonaventura/Desktop/Annotations/voxel_tile_vol_reg_to_Block07.nii.gz'
     #Could be nice to load them all here so they can be toggled through in the viewer- I.E. click side to side and then see Im?
-    bf_cropped_dir = os.path.join(os.path.dirname(reg_show), 'CroppedImages')
+    rabbase = os.path.split(os.path.split(hne_base_dir)[0])[0]
+    bf_cropped_dir = os.path.join(rabbase, 'BlockFace_RGB', 'Block07','CroppedImages')
 
     reg_InV = nib.load(reg_show)
     reg_InV_affine = reg_InV.affine

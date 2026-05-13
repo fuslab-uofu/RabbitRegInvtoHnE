@@ -24,6 +24,8 @@ from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
 from RabbitPathFinder import find_day3_paths, find_day0_paths
 from ApplyTransforms import propagate_tiles_to_day0
+from TileUtils import tiling_tool, load_landmarks, get_bf_slice_index, CSZ_CZI_lookup
+from HnEFeatureExtraction import mean_nonzero, haralick_features, extract_tile_features
 
 
 def ensure_ccw(corners):
@@ -66,187 +68,6 @@ def tiles_to_geojson(coords, output_path):
         json.dump(geojson, f, indent=2)
 
 
-def mean_nonzero(arr, axis=None, **kwargs):
-    masked = np.ma.masked_equal(arr, 0)
-    result = np.ma.mean(masked, axis=axis)
-    return result.filled(0) if isinstance(result, np.ma.MaskedArray) else result
-
-
-#Texture features-
-def haralick_features(image_gray, ignore_zeros=True):
-    # image_gray must be uint8
-    glcm = graycomatrix(image_gray, distances=[1], angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
-                        levels=256, symmetric=True,
-                        normed=False)  # normed=False so we can edit first
-
-    if ignore_zeros:
-        # Exclude co-occurrences involving background (0) pixels
-        glcm[0, :, :, :] = 0
-        glcm[:, 0, :, :] = 0
-
-    # Renormalize
-    glcm_sum = glcm.sum(axis=(0, 1), keepdims=True)
-    glcm = np.where(glcm_sum > 0, glcm / glcm_sum, 0)
-
-    # Average over angles
-    asm = graycoprops(glcm, 'ASM').mean()
-    contrast = graycoprops(glcm, 'contrast').mean()
-    correlation = graycoprops(glcm, 'correlation').mean()
-    homogeneity = graycoprops(glcm, 'homogeneity').mean()
-    energy = np.sqrt(asm)  # energy = sqrt(ASM)
-
-    # Remaining 9 computed directly from GLCM
-    p = glcm.mean(axis=(2, 3))  # average over distances and angles -> (levels, levels)
-    i, j = np.mgrid[0:256, 0:256]
-    mu_i = (i * p).sum()
-    mu_j = (j * p).sum()
-    sig_i = np.sqrt(((i - mu_i) ** 2 * p).sum())
-    sig_j = np.sqrt(((j - mu_j) ** 2 * p).sum())
-
-    p_x = p.sum(axis=1)
-    p_y = p.sum(axis=0)
-
-        # Simpler direct formulas
-    variance = ((i - mu_i) ** 2 * p).sum()
-    dissimilarity = (np.abs(i - j) * p).sum()
-    entropy = -np.sum(p * np.log(p + 1e-10))
-    max_prob = p.max()
-
-    # Sum average, sum variance, sum entropy (use p_xpy = sum along diagonals i+j=k)
-    p_sum = np.zeros(2 * 256)
-    for k in range(2 * 256):
-        mask = (i + j) == k
-        p_sum[k] = p[mask].sum()
-    sum_avg = np.sum(np.arange(2 * 256) * p_sum)
-    sum_entropy = -np.sum(p_sum * np.log(p_sum + 1e-10))
-    sum_var = np.sum((np.arange(2 * 256) - sum_entropy) ** 2 * p_sum)
-
-    # Diff entropy and diff variance (p along |i-j|=k diagonals)
-    p_diff = np.zeros(256)
-    for k in range(256):
-        mask = np.abs(i - j) == k
-        p_diff[k] = p[mask].sum()
-    diff_var = np.sum(np.arange(256) ** 2 * p_diff) - np.sum(np.arange(256) * p_diff) ** 2
-    diff_entropy = -np.sum(p_diff * np.log(p_diff + 1e-10))
-
-    return np.array([asm, contrast, correlation, variance, homogeneity,
-                     sum_avg, sum_var, sum_entropy, entropy,
-                     diff_var, diff_entropy, energy, dissimilarity, max_prob])
-
-def extract_features(czi_patch, tformed_quad, mask, mask_labels):
-    """Compute H&E color stats, haralick features, and mask label for one tile.
-    Returns a feature dict, or None if the tile should be skipped (ambiguous mask label)."""
-    haralick_names = ['asm', 'contrast', 'correlation', 'variance', 'homogeneity',
-                      'sum_avg', 'sum_var', 'sum_entropy', 'entropy',
-                      'diff_var', 'diff_entropy', 'energy', 'dissimilarity', 'max_prob']
-
-    patch_f = czi_patch.astype(float)
-    patch_f[patch_f == 0] = np.nan
-    flat = patch_f.reshape(-1, 3)
-    means = np.nanmean(flat, axis=0)
-    stds = np.nanstd(flat, axis=0)
-
-    features = {
-        'mean_R': means[0], 'mean_G': means[1], 'mean_B': means[2],
-        'std_R': stds[0], 'std_G': stds[1], 'std_B': stds[2],
-    }
-
-    redchan = czi_patch[:, :, 0].astype(np.uint8)
-    features.update({f'red_{n}': v for n, v in zip(haralick_names, haralick_features(redchan))})
-    bluechan = czi_patch[:, :, 2].astype(np.uint8)
-    features.update({f'blue_{n}': v for n, v in zip(haralick_names, haralick_features(bluechan))})
-
-    if mask is not None:
-        label = label_tile_from_mask(mask, tformed_quad, mask_labels)
-        if label is None:
-            return None
-        features['label'] = label
-
-    #This is not built to go here yet placeholder code will need to be reworked a bit for functionality-
-    # ds_list=[]
-    # for r in range(5):
-    # #Playing with downsampling->
-    #     r=r+1
-    #     block_size = (50*r, 50*r, 1)
-    #     downsampled_array_avg = block_reduce(czi_patch, block_size=block_size, func=mean_nonzero).astype(np.uint8)
-    #     ds_list.append(downsampled_array_avg)
-    # #Starter Features->>
-    #
-    # #Mean intensity of all three color channels->
-    # nancopy=czi_patch.astype(float)
-    # nancopy[nancopy==0]=np.nan
-    # HnEFeatures[tile, 2:5]= np.nanmean(np.nanmean(nancopy, axis=0), axis=0)
-
-    # Texture features-
-    # 1st convert patch to greyscale->
-    # Apply to red and green color channels seperately->
-    # redchan= czi_patch[:,:,0].astype(np.uint8)
-    # textfeatures_red = haralick_features(redchan)
-    # HnEFeatures[tile, 5:19] = textfeatures_red
-    #
-    # bluechan= czi_patch[:,:,2].astype(np.uint8)
-    # textfeatures_blue = haralick_features(bluechan)
-    # HnEFeatures[tile, 19:33] = textfeatures_blue
-
-    # for s in range(5):
-    #     start= 33+ s*28
-    #     redchan = ds_list[s][:, :, 0].astype(np.uint8)
-    #     textfeatures_red = haralick_features(redchan)
-    #     HnEFeatures[i, start:start+14] = textfeatures_red
-    #
-    #     bluechan = ds_list[s][:, :, 2].astype(np.uint8)
-    #     textfeatures_blue = haralick_features(bluechan)
-    #     HnEFeatures[i, start+14:start+28] = textfeatures_blue
-
-
-    #MR features- Likewise not flushed out at all!
-    # dy, dx = np.gradient(MR_Tile)
-    #
-    # MRFeatures[tile, 2] = np.mean(MR_Tile)
-    # MRFeatures[tile, 3] = np.std(MR_Tile)
-    # MRFeatures[tile, 4] = np.mean(dx)
-    # MRFeatures[tile, 5] = np.mean(dy)
-
-    # print(MRFeatures[tile, :6])
-
-    return features
-
-
-def load_landmarks(hne_path, img_number):
-    """Load the landmarks .npy file containing img_number from the Landmarks folder inside hne_path."""
-    landmarks_dir = os.path.join(hne_path, 'Landmarks')
-    filepath = next(os.path.join(landmarks_dir, f) for f in os.listdir(landmarks_dir)
-                    if img_number in f and f.endswith('.npy') and not f.startswith('._'))
-    return np.load(filepath, allow_pickle=True)
-
-def get_bf_slice_index(bf_cropped_dir, img_number):
-    """Return the NIfTI slice index of the blockface image matching img_number.
-    All tiffs (including _scatter_fill) are included in ordering to match NIfTI build order,
-    but the match only targets _scatter.tiff files."""
-    all_files = sorted(f for f in os.listdir(bf_cropped_dir)
-                       if f.endswith('.tiff') and not f.startswith('._'))
-    match = next(f for f in all_files if img_number in f and f.endswith('_scatter.tiff'))
-    return all_files.index(match)
-
-def CSZ_CZI_lookup(rab_ID, block, file_numb):
-    BaseCephPath = "/System/Volumes/Data/ceph/hifu/animal_data/IACUC1800/"
-    block_no = block.lower()
-    print(block_no)
-    # Path to CSV-
-    csv_dirpath = os.path.join(BaseCephPath, rab_ID, rab_ID + "_BlockFaceImages", block_no, "csv_files")
-    files = [f for f in os.listdir(csv_dirpath) if f.endswith('csv')]
-    sorted_filenames = sorted(files, key=lambda x: float(re.findall(r'\d+', x)[0]))
-    csv_file = sorted_filenames[-1]
-    csv_filepath = os.path.join(csv_dirpath, csv_file)
-    # Load in the csv file to get the proper term to rename czi files-
-    df = pd.read_csv(csv_filepath, header=None)
-    row = df[df.iloc[:, 0].str.contains(file_numb)]
-    czi_name = row.iloc[0, 2].split(';')[0]
-    # Path to CZI directory-
-    czi_dirpath = os.path.join(BaseCephPath, rab_ID, rab_ID + "_HnE_5x", block_no)
-    czi_file = next(f for f in os.listdir(czi_dirpath) if czi_name in f)
-    czi_path = os.path.join(czi_dirpath, czi_file)
-    return czi_path
 
 
 def draw_line_3d(vol, p0, p1, val):
@@ -263,56 +84,6 @@ def norm255(arr):
     m = np.max(arr)
     return arr / m * 255 if m > 0 else arr
 
-def tiling_tool(twoDIm, tile_size):
-    #Mask out background->
-    rgbmean = np.mean(twoDIm, axis=2)
-    whiteIm=np.where(rgbmean>210,0,1)
-    twoDIm= twoDIm * whiteIm[:, :, np.newaxis]
-    print(twoDIm.shape[0], twoDIm.shape[1])
-    yrem= twoDIm.shape[0]%tile_size
-    if yrem:
-        ystart= yrem//2
-        ycount=int(twoDIm.shape[0]//tile_size)
-    else:
-        ycount=int(twoDIm.shape[0]/tile_size)
-        ystart=0
-    xrem= twoDIm.shape[1]%tile_size
-    if xrem:
-        xstart= xrem//2
-        xcount=int(twoDIm.shape[1]//tile_size)
-    else:
-        xcount=int(twoDIm.shape[1]/tile_size)
-        xstart=0
-
-    print(ystart, xstart, ycount, xcount)
-
-    tilesList=[]
-    for row in range(ycount):
-        for col in range(xcount):
-            tile = twoDIm[ystart+row*tile_size:ystart+(row+1)*tile_size, xstart+col*tile_size:xstart+(col+1)*tile_size, :]
-            zero_mask = np.all(tile == 0, axis=-1)  # shape: (H, W) boolean
-            zero_count = np.sum(zero_mask)
-            if zero_count < (tile_size**2)/6:
-                org= [ystart+row*tile_size, xstart+col*tile_size]
-                tilesList.append(org)
-
-    tilesarray=np.asarray(tilesList)
-    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
-    ax.imshow(twoDIm)  # drop cmap if RGB-
-
-    for tile in range(tilesarray.shape[0]):
-        row= tilesarray[tile,0]
-        col= tilesarray[tile,1]
-        color = 'green'
-        rect = patches.Rectangle(
-            (col, row),  # note: matplotlib uses (x, y) = (col, row)
-            tile_size, tile_size,
-            linewidth=1, edgecolor=color, facecolor='none'
-        )
-        ax.add_patch(rect)
-    plt.tight_layout()
-    plt.show()
-    return tilesarray
 
 
 def label_tile_from_mask(mask, tformed_quad, mask_labels, mask_ds=20, threshold=0.8):
@@ -426,12 +197,12 @@ if __name__ == '__main__':
         czifile = CziFile(CZI_filepath)
         bbox = czifile.get_mosaic_bounding_box()
 
-        #If we want to look at a downsampled CZI file- useful for verifying splines transform is acting how we want-
+        # If we want to look at a downsampled CZI file- useful for verifying splines transform is acting how we want-
         # czi_patch = czifile.read_mosaic(C=0, scale_factor=1/10, region=(bbox.x, bbox.y, bbox.w, bbox.h))[0]
         # czi_patch[:, :, [0, 2]] = czi_patch[:, :, [2, 0]]  #Swap color channels for RGB vs BGR conventions
-        #output_image = ski.transform.warp(hne_ds_im, splines_inv, output_shape=(czi_img.shape[0]*scale_fac, czi_img.shape[1]*scale_fac, czi_img.shape[2]))
-        ## normalize and convert to uint8
-        #output_image = (output_image / np.max(output_image) * 255).astype(np.uint8)
+        # output_image = ski.transform.warp(hne_ds_im, splines_inv, output_shape=(czi_img.shape[0]*scale_fac, czi_img.shape[1]*scale_fac, czi_img.shape[2]))
+        # # normalize and convert to uint8
+        # output_image = (output_image / np.max(output_image) * 255).astype(np.uint8)
         # tformed_origins = splines(origin_list[:, ::-1])[:, ::-1]* 2
 
         #Showing Tiles over slices in bf space->
@@ -568,7 +339,7 @@ if __name__ == '__main__':
                       'czi_r_max': czi_r_max, 'czi_c_max': czi_c_max}
 
             if extract_features:
-                hne_features = extract_features(czi_patch, tformed_quad, mask, mask_labels)
+                hne_features = extract_tile_features(czi_patch, tformed_quad, mask, mask_labels)
                 if hne_features is None:
                     continue
                 record.update(hne_features)
@@ -729,7 +500,7 @@ if __name__ == '__main__':
                 fig, axes = plt.subplots(1, 3 + n_extra, figsize=(4 * (4 + n_extra), 4))
                 axes[0].imshow(np.rot90(rd['czi_patch'], k=3))
                 axes[0].set_title('Original H&E')
-                axes[1].imshow(rd['MR_Tile2'], cmap='gray', vmin=rd['vmin'], vmax=rd['vmax'])
+                axes[1].imshow(rd['target_patch_oblique'], cmap='gray', vmin=rd['vmin'], vmax=rd['vmax'])
                 axes[1].set_title('T1w CE MR')
                 axes[2].imshow(np.rot90(np.fliplr(rd['target_patch_oblique'])), cmap='gray', vmin=rd['vmin'], vmax=rd['vmax'])
                 axes[2].set_title('Tile Prop Back to In.V.')
@@ -746,11 +517,11 @@ if __name__ == '__main__':
 
         if save_tile_overlays and target_space == "InVivo" and Extend_Thru_InVivo:
             for stem, marked_vol in day3_marked_vols.items():
-                save_path = os.path.join(output_dir, f'{slide_id}_Day3_{stem}_tile_overlay.nii.gz')
+                save_path = os.path.join(output_dir, f'{slide_id}_Day3_{stem}_tile_overlay2.nii.gz')
                 nib.save(nib.Nifti1Image(marked_vol.astype(np.float32), day3_affines[stem], day3_headers[stem]), save_path)
                 print(f'Saved Day3 tile overlay to {save_path}')
             for stem, marked_vol in day0_marked_vols.items():
-                save_path = os.path.join(output_dir, f'{slide_id}_Day0_{stem}_tile_overlay.nii.gz')
+                save_path = os.path.join(output_dir, f'{slide_id}_Day0_{stem}_tile_overlay2.nii.gz')
                 nib.save(nib.Nifti1Image(marked_vol.astype(np.float32), day0_affines[stem], day0_headers[stem]), save_path)
                 print(f'Saved Day0 tile overlay to {save_path}')
 

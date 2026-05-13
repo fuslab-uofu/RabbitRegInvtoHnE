@@ -322,14 +322,15 @@ def propagate_tiles_to_Invivo_spaces(target_corners, RabbitID, RabbitFolder, Blo
     return result
 
 
-def propagate_tiles_to_day0(start_day3_corners, affine_field, splines_field, sdiff_field, n_iter=20):
+def propagate_tiles_to_day0(start_day3_corners, affine_field, splines_field, sdiff_field,
+                             n_iter=20, alpha=1.0, verbose=False):
     """
     Map tile corners from Start Day3 structural voxel space to Day0 voxel space by
     inverting the composed Amanpreet deformation fields via fixed-point iteration.
 
     Each field is an inverse warp: field[q] gives the source (Day3-side) coordinate
     for Day0 output voxel q.  Field shape: (3, X, Y, Z), channels field[0]=Z, field[1]=Y,
-    field[2]=X, 0-indexed absolute voxel coordinates.
+    field[2]=X, 1-indexed absolute voxel coordinates (Amanpreet convention).
 
     The fields are applied in order affine → splines → sdiff (outermost to innermost),
     so the composed forward map is F(q) = affine[splines[sdiff[q]]].
@@ -338,24 +339,31 @@ def propagate_tiles_to_day0(start_day3_corners, affine_field, splines_field, sdi
     affine_field       : Affine_deformation.npy as numpy array (3, X, Y, Z)
     splines_field      : SplinesProjection.npy as numpy array (3, X, Y, Z)
     sdiff_field        : sdiff.npy as numpy array (3, X, Y, Z)
-    n_iter             : fixed-point iterations (20 is sufficient for typical deformations)
+    n_iter             : number of fixed-point iterations
+    alpha              : step size (1.0 = full step; <1.0 damps oscillation in large-deformation regions)
+    verbose            : if True, print max residual per iteration (convergence curve)
     Returns            : (N_tiles, 4, 3) voxel coords in Day0 structural space
     """
     from scipy.ndimage import map_coordinates
 
     def _sample(field, pts):
         coords = pts.T  # (3, N) = (X, Y, Z) indices into field spatial dims
-        fx = map_coordinates(field[2], coords, order=1, mode='nearest')
-        fy = map_coordinates(field[1], coords, order=1, mode='nearest')
-        fz = map_coordinates(field[0], coords, order=1, mode='nearest')
+        # Fields store 1-indexed voxel coords (Amanpreet's convention); subtract 1 for 0-indexed.
+        fx = map_coordinates(field[2], coords, order=1, mode='nearest') - 1
+        fy = map_coordinates(field[1], coords, order=1, mode='nearest') - 1
+        fz = map_coordinates(field[0], coords, order=1, mode='nearest') - 1
         return np.stack([fx, fy, fz], axis=1)  # (N, 3) in XYZ
 
     p = start_day3_corners.reshape(-1, 3).astype(np.float64)
     q = p.copy()
 
-    for _ in range(n_iter):
-        src = _sample(affine_field, _sample(splines_field, _sample(sdiff_field, q)))
-        q = q + (p - src)
+    for i in range(n_iter):
+        src      = _sample(affine_field, _sample(splines_field, _sample(sdiff_field, q)))
+        residual = p - src
+        if verbose:
+            mag = np.linalg.norm(residual, axis=1)
+            print(f"  iter {i+1:3d}: median={np.median(mag):.4f}  p95={np.percentile(mag, 95):.4f}  max={mag.max():.4f} voxels")
+        q = q + alpha * residual
 
     return q.reshape(start_day3_corners.shape)
 
