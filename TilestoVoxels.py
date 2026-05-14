@@ -333,7 +333,7 @@ if __name__ == '__main__':
                 geojson_features.append({
                     "type": "Feature",
                     "geometry": {"type": "Polygon", "coordinates": [ring]},
-                    "properties": {"object_type": "annotation", "poly_id": int(pid)}
+                    "properties": {"object_type": "annotation", "name": f"tile_{pid}", "poly_id": int(pid)}
                 })
             geojson_path = os.path.join(features_dir, f'voxel_polygons_{czi_stem}.geojson')
             with open(geojson_path, 'w') as f:

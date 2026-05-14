@@ -37,9 +37,9 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpola
 
     # Pre-load an arbitrary moving volume if provided, bypassing the standard path lookup
     if moving_path is not None:
-        _nib = nib.load(moving_path)
-        current_volume = np.asanyarray(_nib.dataobj).astype(np.float32)
-        current_affine = nib.as_closest_canonical(_nib).affine
+        _nib_canonical = nib.as_closest_canonical(nib.load(moving_path))
+        current_volume = np.asanyarray(_nib_canonical.dataobj).astype(np.float32)
+        current_affine = _nib_canonical.affine
     else:
         current_volume = None
         current_affine = None
@@ -116,10 +116,10 @@ def MultiStepRegDir(input_dir, RabbitID, Block, RabbitFolder, MovingStart, EndFi
         print(f"  Saved → {out_path}")
 
 #Single file run through-
-#MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='nearest')
+MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='nearest')
 
 #Run through all the files in a directory-
-MultiStepRegDir(RegDir, RabbitID, Block, RabbitFolder,"InVivo", "BlockFace",interpolation='nearest')
+#MultiStepRegDir(RegDir, RabbitID, Block, RabbitFolder,"InVivo", "BlockFace",interpolation='nearest')
 
 #Buggy- needs work before implementation
 # resampled=compose_e_resample(SlicerTPath, dfieldpath, fixed_image, moving_image)

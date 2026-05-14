@@ -19,6 +19,9 @@ from skimage.measure import block_reduce
 import torch
 from PIL import Image
 
+
+#Starter code for tiling visual comp tool
+
 def tiling_tool(twoDIm, tile_size):
     #Mask out background->
     rgbmean = np.mean(twoDIm, axis=2)
