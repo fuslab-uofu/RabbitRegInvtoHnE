@@ -1,4 +1,6 @@
 import os
+import csv
+import glob
 from pathlib import Path
 import nibabel as nib
 import SimpleITK as sitk
@@ -10,6 +12,14 @@ def find_nii(directory):
         if matches:
             return matches[0]
     return None
+
+def get_assess_data(parent_folder):
+    assess_folder = os.path.join(parent_folder, 'RegAssessData')
+    nifti_path = find_nii(assess_folder)
+    #Can add LMs as well here when we're ready
+    return nifti_path
+
+
 
 def find_all_the_paths(RabbitID, Block, pathtoRabbits, Moving):
     BlockID= "Block"+f"{Block:02d}"
@@ -38,12 +48,52 @@ def find_all_the_paths(RabbitID, Block, pathtoRabbits, Moving):
 
     return {
         "Moving_FilePath": find_nii(moving_file_folder),
+        "Moving_Folder":   moving_file_folder,
         "Fixed_FilePath":  find_nii(fixed_file_folder),
         "Fixed_Folder":    fixed_file_folder,
         "RegFold":         os.path.join(moving_reg_folder, 'RegTransforms'),
         "RegDataOut":      os.path.join(moving_reg_folder, 'RegDataOut'),
         "RegDataProc":     os.path.join(moving_reg_folder, 'RegDataProc'),
     }
+
+def find_day0_paths(RabbitID, pathtoRabbits):
+    day0_dir = os.path.join(pathtoRabbits, RabbitID, 'InVivo_MR', 'InVMRDataSets', 'Day0')
+    return {
+        'day0_dir': day0_dir,
+        'vols':     sorted(glob.glob(os.path.join(day0_dir, '*.nii.gz'))),
+    }
+
+
+def find_day3_paths(RabbitID, pathtoRabbits):
+    day3_dir = os.path.join(pathtoRabbits, RabbitID, 'InVivo_MR', 'InVMRDataSets', 'Day3')
+
+    log_matches = glob.glob(os.path.join(day3_dir, '*InVDay3Log.csv'))
+    if not log_matches:
+        raise FileNotFoundError(f"No InVDay3Log.csv found in {day3_dir}")
+
+    stem_to_category = {}
+    with open(log_matches[0]) as f:
+        for row in csv.DictReader(f):
+            stem_to_category[row['File Name'].strip()] = row['Home'].strip()
+
+    start_vols, end_vols, fixed_vols = [], [], []
+    for path in sorted(glob.glob(os.path.join(day3_dir, '*.nii.gz'))):
+        stem = os.path.basename(path).replace('.nii.gz', '')
+        category = stem_to_category.get(stem)
+        if category == 'Start':     start_vols.append(path)
+        elif category == 'End':     end_vols.append(path)
+        elif category == 'Fixed':   fixed_vols.append(path)
+
+    return {
+        'day3_dir':            day3_dir,
+        'start_vols':          start_vols,
+        'end_vols':            end_vols,
+        'fixed_vols':          fixed_vols,
+        'transform_path':      os.path.join(day3_dir, 'Day3_end_to_start_Transform.h5'),
+        'inv_transform_cache': os.path.join(day3_dir, 'Day3_end_to_start_inv_cached.h5'),
+        'aps_transform_folder': os.path.join(os.path.dirname(day3_dir), 'Transforms'),
+    }
+
 
 #For debugging-
 def print_geometry_diagnostics(paths, label):
