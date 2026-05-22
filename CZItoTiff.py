@@ -9,12 +9,12 @@ import math
 import ast
 
 #Now to add pointing so we can go from rabbit number and block to all of this-
-rab_ID='R24-101'
-block_no='block09'
+rab_ID='R24-058'
+block_no='block05'
 
 
 # #Path to Savepoint-
-BaseSavePath="/Users/jbonaventura/Downloads/"
+BaseSavePath="//System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData"
 save_dirpath=os.path.join(BaseSavePath, rab_ID, "HnE", block_no)
 if not os.path.exists(save_dirpath):
     os.makedirs(save_dirpath)

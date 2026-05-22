@@ -37,11 +37,11 @@ for file_path in files:
     img_array = np.array(img)
     #Change Crop region-
     cropped_im=img_array[775:3300,1500:3400,:]
-    # plt.imshow(cropped_im)
-    # plt.show()
+    plt.imshow(cropped_im)
+    plt.show()
 
-    # # Save the image as a TIFF file
-    file_name = os.path.splitext(os.path.basename(file_path))[0]
-    new_file_path=os.path.join(new_dir_path, file_name + ".tiff")
-    CImage = Image.fromarray(cropped_im)
-    CImage.save(new_file_path, 'TIFF')
+    # # # Save the image as a TIFF file
+    # file_name = os.path.splitext(os.path.basename(file_path))[0]
+    # new_file_path=os.path.join(new_dir_path, file_name + ".tiff")
+    # CImage = Image.fromarray(cropped_im)
+    # CImage.save(new_file_path, 'TIFF')
