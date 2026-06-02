@@ -21,7 +21,7 @@ from scipy.linalg import solve
 from scipy.ndimage import map_coordinates
 
 import skimage as ski
-from tps import ThinPlateSpline
+#from tps import ThinPlateSpline
 from concurrent.futures import ThreadPoolExecutor
 
 

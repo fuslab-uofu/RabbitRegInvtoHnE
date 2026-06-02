@@ -10,7 +10,7 @@ import ast
 
 #Now to add pointing so we can go from rabbit number and block to all of this-
 rab_ID='R24-058'
-block_no=4
+block_no=7
 
 # #Path to Savepoint-
 BaseSavePath="/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData"
