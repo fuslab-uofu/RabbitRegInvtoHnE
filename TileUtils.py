@@ -56,7 +56,7 @@ def get_bf_slice_index(bf_cropped_dir, img_number):
     return all_files.index(match)
 
 
-def CSZ_CZI_lookup(rab_ID, block, file_numb):
+def CSV_CZI_lookup(rab_ID, block, file_numb):
     BaseCephPath = "/System/Volumes/Data/ceph/hifu/animal_data/IACUC1800/"
     block_no = block.lower()
     # Path to CSV-

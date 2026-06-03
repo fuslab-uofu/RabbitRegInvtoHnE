@@ -213,7 +213,7 @@ def view_tre(source_vol_path, target_vol_path, source_mrk_path, target_mrk_path,
 
 LMFolder = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/ExVivo_MRBlocked/Block06/RegAssessData"
 src, tgt = landmark_paths_from_folder(LMFolder)
-dfield = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/ExVivo_MRBlocked/Block06/RegTransforms/LMExVtoBlockFace.pt"
+dfield = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/ExVivo_MRBlocked/Block06/RegTransforms/LMExVtoBlock06.pt"
 
 view_tre(
     source_vol_path="/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/ExVivo_MRBlocked/Block06/RegDataProc/ExVivoBlock06ResampledToBlockFace06.nii.gz",

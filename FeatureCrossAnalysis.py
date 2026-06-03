@@ -24,7 +24,7 @@ from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
 from RabbitPathFinder import find_day3_paths, find_day0_paths
 from ApplyTransforms import propagate_tiles_to_day0
-from TileUtils import tiling_tool, load_landmarks, get_bf_slice_index, CSZ_CZI_lookup
+from TileUtils import tiling_tool, load_landmarks, get_bf_slice_index, CSV_CZI_lookup
 from HnEFeatureExtraction import mean_nonzero, haralick_features, extract_tile_features
 
 

@@ -23,7 +23,7 @@ from skimage.color import rgb2gray
 from skimage.measure import block_reduce
 import torch
 from PIL import Image
-from TileUtils import tiling_tool, load_landmarks, get_bf_slice_index, CSZ_CZI_lookup
+from TileUtils import tiling_tool, load_landmarks, get_bf_slice_index, CSV_CZI_lookup
 from shapely.geometry import Polygon
 from HnEFeatureExtraction import extract_features
 
@@ -108,7 +108,7 @@ if __name__ == '__main__':
         #Finding tps transform between CZI and blockface->
         img_number = re.search(r'\d+', hne_filenames[img]).group()  # e.g. '0011'
         landmarks = load_landmarks(hne_base_dir, img_number)
-        CZI_filepath = CSZ_CZI_lookup(Rabbit, Block, img_number)
+        CZI_filepath = CSV_CZI_lookup(Rabbit, Block, img_number)
 
         scale_fac=20 #scale factor between HnE raw and downsampled
         src = np.array([[p.y(), p.x()] for p in landmarks[0]])*3  # fixed
@@ -261,16 +261,16 @@ if __name__ == '__main__':
                 chunk_img = czifile.read_mosaic(C=0, scale_factor=1, region=(rx, ry, rx_end - rx, ry_end - ry))[0]
                 chunk_img[:, :, [0, 2]] = chunk_img[:, :, [2, 0]]  # BGR→RGB
 
-                # fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-                # ax.imshow(chunk_img)
-                # for i, (poly, _, _) in enumerate(in_chunk):
-                #     px, py = poly.exterior.xy
-                #     ax.plot(np.array(px) * scale_fac + bbox.x - rx,
-                #             np.array(py) * scale_fac + bbox.y - ry,
-                #             '-', color=colors[i % 10], linewidth=1)
-                # ax.axis('off')
-                # plt.tight_layout()
-                # plt.show()
+                fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+                ax.imshow(chunk_img)
+                for i, (poly, _, _) in enumerate(in_chunk):
+                    px, py = poly.exterior.xy
+                    ax.plot(np.array(px) * scale_fac + bbox.x - rx,
+                            np.array(py) * scale_fac + bbox.y - ry,
+                            '-', color=colors[i % 10], linewidth=1)
+                ax.axis('off')
+                plt.tight_layout()
+                plt.show()
 
                 for poly, pid, (centroid_row, centroid_col) in in_chunk:
                     px, py = poly.exterior.xy

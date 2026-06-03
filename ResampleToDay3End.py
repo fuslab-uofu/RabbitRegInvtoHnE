@@ -23,7 +23,6 @@ import nibabel as nib
 import SimpleITK as sitk
 from scipy.ndimage import map_coordinates
 import csv
-
 from ApplyTransforms import ApplySlicerTransform, propagate_tiles_to_day0
 
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
@@ -49,14 +48,17 @@ def _load_day3_log(day3_dir, rabbit_id):
     roles = {}
     with open(log_path, newline='') as f:
         for row in csv.DictReader(f):
-            roles[row['Home'].strip()] = os.path.join(day3_dir, row['File Name'].strip() + '.nii.gz')
+            key = row['Home'].strip()
+            val = os.path.join(day3_dir, row['File Name'].strip() + '.nii.gz')
+            roles.setdefault(key, []).append(val)
     return roles
 
 _day3 = _load_day3_log(DAY3_DIR, RABBIT_ID)
 
-DAY3_END_PATH     = _day3['End']
-DAY3_START_STRUCT = _day3['Fixed']
-DAY3_START_EXTRA  = [v for k, v in _day3.items() if k == 'Start']
+DAY3_END_PATH     = _day3['End'][0]
+DAY3_START_STRUCT = _day3['Fixed'][0]
+DAY3_START_EXTRA  = _day3.get('Start', [])
+print("Day3 Extras- ", DAY3_START_EXTRA)
 
 SLICER_INV_CACHE  = os.path.join(DAY3_DIR, 'Day3_end_to_start_inv_cached.h5')
 AFFINE_FIELD_PATH = os.path.join(XFMS_DIR, 'Affine_deformation.npy')
@@ -326,6 +328,7 @@ if __name__ == '__main__':
     os.makedirs(OUT_DIR, exist_ok=True)
 
     day3_end_nib   = nib.load(DAY3_END_PATH)
+    print(DAY3_END_PATH)
     day3_start_nib = nib.load(DAY3_START_STRUCT)
     inv_composite  = _load_transform(SLICER_INV_CACHE)
 
@@ -335,11 +338,20 @@ if __name__ == '__main__':
             print(f"Skipping (not found): {path}")
             continue
         stem = os.path.basename(path).replace('.nii.gz', '')
+        print(path)
+        print(nib.load(path).header.get_data_dtype())
+        h = nib.load(path).header
+        print(h.get_slope_inter())  # (scl_slope, scl_inter)
         out  = os.path.join(OUT_DIR, f'{stem}_regToDay3End.nii.gz')
         print(f"Resampling {stem} → Day3_end ...")
         _interp = {0: sitk.sitkNearestNeighbor, 1: sitk.sitkLinear}[INTERP_ORDER]
         arr = ApplySlicerTransform(path, DAY3_END_PATH, SLICER_INV_CACHE, interpolator=_interp)
-        nib.save(nib.Nifti1Image(arr, day3_end_nib.affine, day3_end_nib.header), out)
+
+        print(f"  arr dtype: {arr.dtype}")
+        print(f"  unique values sample: {np.unique(arr[arr > 0])[:20]}")
+        print(f"  min step: {np.diff(np.unique(arr[arr > 0])).min():.6f}")
+
+        nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
         print(f"  Saved → {out}")
 
     # --- Build / load Day3_end → Day0 displacement field ---
@@ -368,7 +380,7 @@ if __name__ == '__main__':
         print(f"Resampling Day0/{stem} → Day3_end ...")
         vol_arr = nib.load(path).get_fdata(dtype=np.float32)
         arr     = resample_with_field(vol_arr, voxel_field, order=INTERP_ORDER)
-        nib.save(nib.Nifti1Image(arr, day3_end_nib.affine, day3_end_nib.header), out)
+        nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
         print(f"  Saved → {out}")
 
     print("All done.")

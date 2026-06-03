@@ -13,7 +13,7 @@ import glob
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
 RabbitID="R23-055"
-Block = 7
+Block = 5
 
 #If we're working from a directory->
 RegDir="/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/InVivo_MR/InVMRDataSets/Day3End_Registered"
@@ -115,11 +115,43 @@ def MultiStepRegDir(input_dir, RabbitID, Block, RabbitFolder, MovingStart, EndFi
         nib.save(nib.Nifti1Image(result, affine), out_path)
         print(f"  Saved → {out_path}")
 
+def MultiStartRegToFixed(RabbitID, Block, RabbitFolder, EndFixed, interpolation='nearest'):
+    """
+    Register every valid starting point to EndFixed and save each result to that
+    moving stage's RegDataOut folder.
+
+    e.g. EndFixed='BlockFace' produces:
+        InVivoRegToBlock07_timestamp.nii.gz      → InVivo_MR/RegDataOut/
+        ExVivoRegToBlock07_timestamp.nii.gz      → ExVivo_MR/Block07Reg/RegDataOut/
+        ExVivoBlock07RegToBlock07_timestamp.nii.gz → ExVivo_MRBlocked/Block07/RegDataOut/
+    """
+    PROGRESSION = ["InVivo", "ExVivo", "ExVivoBlock", "BlockFace"]
+    end_idx = PROGRESSION.index(EndFixed)
+    end_label = EndFixed.replace("ExVivoBlock", f"ExVivoBlock{Block:02d}").replace("BlockFace", f"Block{Block:02d}")
+
+    timestamp = datetime.now().strftime("%m%d-%H%M")
+
+    for moving_key in PROGRESSION[:end_idx]:
+        print(f"Registering {moving_key} → {EndFixed}...")
+        result, affine = MultiStepReg(RabbitID, Block, RabbitFolder, moving_key, EndFixed,
+                                      interpolation=interpolation, save=False)
+        save_paths = find_all_the_paths(RabbitID, Block, RabbitFolder, moving_key)
+        out_dir = save_paths['RegDataOut']
+        os.makedirs(out_dir, exist_ok=True)
+        out_name = f"{moving_key}RegTo{end_label}_{timestamp}.nii.gz"
+        out_path = os.path.join(out_dir, out_name)
+        nib.save(nib.Nifti1Image(result, affine), out_path)
+        print(f"  Saved → {out_path}")
+
+
 #Single file run through-
-MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='nearest')
+#MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='nearest')
 
 #Run through all the files in a directory-
 #MultiStepRegDir(RegDir, RabbitID, Block, RabbitFolder,"InVivo", "BlockFace",interpolation='nearest')
+
+MultiStartRegToFixed(RabbitID, Block, RabbitFolder, "BlockFace")
+
 
 #Buggy- needs work before implementation
 # resampled=compose_e_resample(SlicerTPath, dfieldpath, fixed_image, moving_image)
