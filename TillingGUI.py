@@ -5,7 +5,7 @@ import numpy as np
 import nibabel as nib
 from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QSlider, QCheckBox, QLabel, QGroupBox, QComboBox)
+                             QSlider, QCheckBox, QLabel, QGroupBox, QComboBox, QPushButton, QFileDialog)
 from PyQt5.QtCore import Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.pyplot as plt
@@ -27,41 +27,103 @@ class TillingGUI(QMainWindow):
         self.left_asset_path = None
         self.right_asset_path = None
 
-        self.discover_all_volumes()
+        self.discover_all_volumes(max=10)
         self.load_histology_data()
         self.init_ui()
 
 
 
-    def discover_all_volumes(self):
+    def discover_all_volumes(self, max):
         """
         Recursively scans the MR root folder for any Nifti files residing
         within a 'RegDataOut' directory sub-tree.
         """
-        self.available_volumes = [{'display_name': 'H&E Histology', 'path': 'HNE'}]
+        self.available_volumes = [
+            {'display_name': "H&E Histology", 'path': 'HNE'},
+            {'display_name': "Blockface RGB", 'path': 'BF'}  # <-- Added choice tracking link
+        ]
 
         # Recursive glob search for all .nii.gz files inside the rabbit's MR tree
         search_pattern = os.path.join(self.rabbit_mr_root, '**', '*.nii.gz')
         all_niftis = glob.glob(search_pattern, recursive=True)
 
+        grouped_files = {}
+
+        timestamp_regex = re.compile(r'_(\d{2})(\d{2})-(\d{2})(\d{2})\.nii\.gz$')
+
         for fpath in sorted(all_niftis):
             # Check if 'RegDataOut' is part of the file path steps
             path_segments = fpath.split(os.sep)
             if 'RegDataOut' in path_segments:
-                # Extract context labels from path to make dropdown item clearly distinguishable
-                # e.g., 'InVivo_MR' vs 'ExVivo_MR/Block04Out'
-                try:
-                    reg_index = path_segments.index('RegDataOut')
-                    context_label = "/".join(path_segments[reg_index - 2:reg_index])
-                except (ValueError, IndexError):
-                    context_label = "Unknown Stage"
+                filename = os.path.basename(fpath)
+                match = timestamp_regex.match(filename)
 
-                display_name = f"[{context_label}] {os.path.basename(fpath)}"
+                if match:
+                    month, day, hour, minute = map(int, match.groups())
+                    time_key = (month, day, hour, minute)
+                    base_name = filename[:match.start()]
+                else:
+                    time_key = (0,0,0,0)
+                    base_name = filename
 
-                self.available_volumes.append({
-                    'display_name': display_name,
-                    'path': fpath
-                })
+                folder_path = os.path.dirname(fpath)
+                group_key = (folder_path, base_name)
+
+                if group_key not in grouped_files:
+                    grouped_files[group_key] = []
+                grouped_files[group_key].append((time_key, fpath))
+
+        for (folder_path, base_name), occurrences in grouped_files.items():
+            if len(self.available_volumes) > max:
+                break
+            occurrences.sort(key=lambda x: x[0])
+            newest_time_key, newest_fpath = occurrences[-1]
+
+            path_segments = newest_fpath.split(os.sep)
+
+            try:
+                reg_index = path_segments.index('RegDataOut')
+                context_label = "/".join(path_segments[reg_index - 2:reg_index])
+            except (ValueError, IndexError):
+                context_label = "Unknown Stage"
+
+            display_name = f"[{context_label}] {os.path.basename(newest_fpath)}"
+
+            self.available_volumes.append({
+                'display_name': display_name,
+                'path': newest_fpath,
+            })
+
+    def add_custom_volume(self):
+        """Opens a file dialog to manually append a specific .nii.gz volume."""
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Custom NIfTI Volume",
+            self.rabbit_mr_root,  # Starts browsing inside the current rabbit folder
+            "NIfTI Compressed Volumes (*.nii.gz)",  # Strict file filter constraint
+            options=options
+        )
+
+        # If the user selected a valid file
+        if file_path:
+            filename = os.path.basename(file_path)
+            display_name = f"[Manual Load] {filename}"
+
+            # 1. Append to our asset array track
+            new_asset = {
+                'display_name': display_name,
+                'path': file_path
+            }
+            self.available_volumes.append(new_asset)
+
+            # 2. Inject directly into the UI comboboxes dynamically
+            self.left_dropdown.addItem(display_name, file_path)
+            self.right_dropdown.addItem(display_name, file_path)
+
+            # 3. Automatically switch the Right Display to show the newly added file
+            new_index = self.right_dropdown.count() - 1
+            self.right_dropdown.setCurrentIndex(new_index)
 
     def load_volume(self, path):
         if path == 'HNE':
@@ -79,7 +141,14 @@ class TillingGUI(QMainWindow):
 
     def load_histology_data(self):
         """Pre-loads the reference histology slices."""
-        reg_HnE_dir = os.path.join(self.hne_base_dir, 'reg')
+        try:
+            match_folder = next(
+                d for d in os.listdir(self.hne_base_dir)
+                if d.lower() == "reg" and os.path.isdir(os.path.join(self.hne_base_dir, d))
+            )
+            reg_HnE_dir = os.path.join(self.hne_base_dir, match_folder)
+        except StopIteration:
+            raise FileNotFoundError("Reg folder not found")
         self.hne_filenames = sorted(
             f for f in os.listdir(reg_HnE_dir) if f.endswith('.png') and not f.startswith('._'))
         hne_images = [np.array(Image.open(os.path.join(reg_HnE_dir, f))) for f in self.hne_filenames]
@@ -89,6 +158,28 @@ class TillingGUI(QMainWindow):
         # Dynamic fallback parameters if directory tree sizes change slightly
         self.rabbit_id = hne_parts[10] if len(hne_parts) > 10 else "Unknown"
         self.block = hne_parts[12] if len(hne_parts) > 12 else "Unknown"
+
+    def load_blockface_slice(self, img_number):
+        """
+        Locates and loads the specific blockface tiff array corresponding to
+        the active H&E image index sequence padding requirement.
+        """
+        try:
+            # Gather all tiff images inside the target blockface path
+            all_files = sorted(
+                f for f in os.listdir(self.bf_cropped_dir) if f.endswith('.tiff') and not f.startswith('._'))
+
+            # Find the specific target filename that contains your current H&E index string
+            # e.g., looks for "IMG_0003_scatter.tiff" if img_number is "0003"
+            match = next(f for f in all_files if img_number in f and f.endswith('_scatter.tiff'))
+
+            # Construct the absolute path and open the image asset
+            bf_path = os.path.join(self.bf_cropped_dir, match)
+            return np.array(Image.open(bf_path))
+
+        except (StopIteration, FileNotFoundError):
+            # Fallback if a specific slice is missing or index matching fails cleanly
+            return None
 
     def tiling_tool(self, twoDIm, tile_size):
         rgbmean = np.mean(twoDIm, axis=2)
@@ -184,9 +275,13 @@ class TillingGUI(QMainWindow):
         self.grid_checkbox.setChecked(True)
         self.grid_checkbox.stateChanged.connect(self.update_plots)
 
+        self.upload_btn = QPushButton("📂 Load Custom Volume")
+        self.upload_btn.clicked.connect(self.add_custom_volume)
+
+        slider_layout.addWidget(self.slice_label)
         slider_layout.addWidget(self.slider, stretch=2)
         slider_layout.addWidget(self.grid_checkbox)
-        slider_layout.addWidget(self.slice_label)
+        slider_layout.addWidget(self.upload_btn)
         controls_layout.addLayout(slider_layout)
 
         controls_box.setLayout(controls_layout)
@@ -208,6 +303,16 @@ class TillingGUI(QMainWindow):
         if path == 'HNE':
             ax.imshow(hne)
             ax.set_title(f"H&E Histology (Img: {img_number})")
+        elif path == 'BF':
+            # --- NEW BRANCH: Handle Blockface RGB Dynamic Array Processing ---
+            bf_image = self.load_blockface_slice(img_number)
+            if bf_image is not None:
+                ax.imshow(bf_image)
+                ax.set_title(f"Blockface RGB (Img: {img_number})")
+            else:
+                # Fill empty plot array if a coordinate step path is broken
+                ax.text(0.5, 0.5, f"Missing BF: {img_number}", color="orange", ha="center", va="center")
+                ax.set_title("Blockface Missing")
         else:
             vol_arr = self.load_volume(path)
             slice_num = self.get_bf_slice_index(img_number)
@@ -249,14 +354,20 @@ class TillingGUI(QMainWindow):
             origin_list = self.tiling_tool(hne_ds_im, self.tilesize)
 
             if origin_list.ndim == 2 and len(origin_list) > 0:
+                color_palette = ['#ff8b17', '#ffe417', '#b2ff17', '#36ff17', '#17fbff', '#17a6ff']
+
                 for q in range(len(origin_list)):
                     row, col = origin_list[q, 0], origin_list[q, 1]
+                    y = row // self.tilesize
+                    x = col // self.tilesize
+                    idx = (y + x) % len(color_palette)
+                    color = color_palette[idx]
 
                     rect = patches.Rectangle((col, row), self.tilesize, self.tilesize,
-                                                 linewidth=1, edgecolor='cyan', facecolor='none')
+                                                 linewidth=1, edgecolor=color, facecolor='none')
                     self.axes[0].add_patch(rect)
                     rect2 = patches.Rectangle((col, row), self.tilesize, self.tilesize,
-                                             linewidth=1, edgecolor='cyan', facecolor='none')
+                                             linewidth=1, edgecolor=color, facecolor='none')
                     self.axes[1].add_patch(rect2)
 
         for ax in self.axes:
@@ -266,8 +377,8 @@ class TillingGUI(QMainWindow):
         self.canvas.draw()
 
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R23-292"
-Block = 4
+RabbitID="R23-055"
+Block = 5
 
 if __name__ == '__main__':
     blockId = "Block" + f"{Block:02d}"
