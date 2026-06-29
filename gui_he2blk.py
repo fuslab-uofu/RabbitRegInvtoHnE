@@ -7,22 +7,16 @@
 
 
 import sys
+from pathlib import Path
 from PyQt5.QtWidgets import QDialog, QLineEdit,  QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsOpacityEffect, QScrollArea, QVBoxLayout as VBoxLayout
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QSlider, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog, QCheckBox
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QImage
 from PyQt5.QtCore import Qt, QPoint
-import qdarkstyle
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-from scipy.spatial.distance import cdist
-from scipy.linalg import solve
-from scipy.ndimage import map_coordinates
 
 import skimage as ski
-#from tps import ThinPlateSpline
-from concurrent.futures import ThreadPoolExecutor
 
 
 global sf1234
@@ -30,7 +24,7 @@ global sf1234
 sf1234=3
 
 #Can set default folder here to make finding files easier->
-DEFAULT_FOLDER = "/Users/jbonaventura/Downloads/RabbitData/R23-055"
+DEFAULT_FOLDER = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055"
 
 class ImageViewer(QDialog):
     def __init__(self, image):
@@ -56,14 +50,39 @@ class ImageViewer(QDialog):
         self.setLayout(layout)
 
 
+class ZoomableGraphicsView(QGraphicsView):
+    """QGraphicsView with mouse-wheel zoom (centered on the cursor) and click-drag panning."""
+
+    ZOOM_FACTOR = 1.15
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setToolTip("Scroll to zoom, click and drag to pan")
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = self.ZOOM_FACTOR ** (delta / 120.0)
+        current_scale = self.transform().m11()
+        if current_scale * factor < 1.0:
+            factor = 1.0 / current_scale
+        self.scale(factor, factor)
+
+
 class ImageBlenderDialog(QDialog):
-    def __init__(self, img1, img2):
-        super().__init__()
+    def __init__(self, img1, img2, parent=None):
+        super().__init__(parent)
         self.setWindowTitle("Image Blender")
         self.setGeometry(100, 100, 2000, 1800)
-        
-        self.img1 = img1
-        self.img2 = img2
+
+        # Deep-copy: the QImages passed in wrap numpy buffers that may be
+        # garbage-collected once this (non-modal) dialog outlives its caller.
+        self.img1 = img1.copy()
+        self.img2 = img2.copy()
         self.opacity = 0.5
         
         self.initUI()
@@ -72,7 +91,7 @@ class ImageBlenderDialog(QDialog):
         layout = QVBoxLayout()
 
         # Create QGraphicsView widgets to display images
-        self.view = QGraphicsView(self)
+        self.view = ZoomableGraphicsView(self)
         self.update_images()
 
         # Create a horizontal layout for sliders
@@ -90,6 +109,11 @@ class ImageBlenderDialog(QDialog):
         self.opacity_value_label = QLabel("50%")
         slider_layout.addWidget(slider_label)
         slider_layout.addWidget(self.opacity_value_label)
+
+        # Button to reset zoom/pan back to the default view
+        self.reset_zoom_button = QPushButton("Reset Zoom")
+        self.reset_zoom_button.clicked.connect(self.view.resetTransform)
+        slider_layout.addWidget(self.reset_zoom_button)
 
         layout.addWidget(self.view)
         layout.addLayout(slider_layout)
@@ -129,103 +153,6 @@ class ImageBlenderDialog(QDialog):
 
 
 
-# def tps_transform(source_points, target_points, lambda_reg=0.01):
-#     num_points = source_points.shape[0]
-    
-#     # Compute the pairwise squared distances between points
-#     K = cdist(source_points, source_points, 'euclidean')
-#     K = np.where(K == 0, 1e-10, K)  # Avoid division by zero
-    
-#     # Compute the TPS matrix
-#     P = np.column_stack((np.ones((num_points, 1)), source_points))
-#     L = np.zeros((num_points + 3, num_points + 3))
-#     L[:num_points, :num_points] = K
-#     L[:num_points, -3:] = P
-#     L[-3:, :num_points] = P.T
-    
-#     # Regularization term
-#     L[:num_points, :num_points] += lambda_reg * np.eye(num_points)
-    
-#     # Solve the linear system for the TPS parameters
-#     V = np.zeros((num_points + 3, 2))
-#     V[:num_points, :] = target_points
-#     theta = solve(L, V, overwrite_a=True, overwrite_b=True)
-    
-#     return theta
-
-
-# def apply_tps_transform(image, source_points, target_points, theta):
-#     num_points = source_points.shape[0]
-
-#     print(image.shape)
-    
-#     # Compute the affine transformation component
-#     P = np.column_stack((np.ones((num_points, 1)), source_points))
-#     affine = np.dot(P, theta[-3:])
-#     # print(affine.shape)
-    
-#     # Compute the non-linear component
-#     distances = cdist(source_points, target_points, 'euclidean')
-#     # print((distances**2).shape, (distances**2))
-#     # print()
-#     # print(theta[:num_points].shape, theta[:num_points])
-
-#     non_linear = np.sum(np.matmul(distances**2, theta[:num_points]), axis=1)
-    
-#     # Apply the transformation
-#     transformed_points = affine + non_linear[:, np.newaxis]
-#     transformed_image = np.zeros_like(image)
-#     for channel in range(3):
-#         transformed_image[:, :, channel] = map_coordinates(image[:, :, channel], (transformed_points[:, 1], transformed_points[:, 0]), order=3, mode='reflect')
-
-#     # transformed_image = map_coordinates(image, (transformed_points[:, 1], transformed_points[:, 0]), order=3)
-#     # transformed_image = transformed_image.reshape(image.shape)
-    
-#     return transformed_image
-
-
-# Define a function to calculate the TPS transformation
-def tps_transform(src_points, dest_points, lambda_param=0.1):
-    # Calculate the pairwise Euclidean distances between points
-    pairwise_distances = cdist(src_points, src_points)
-    
-    # Compute the TPS matrix K
-    K = pairwise_distances**2 * np.log(pairwise_distances + 1e-6)
-    np.fill_diagonal(K, 0)
-    
-    # Construct the augmented matrix P
-    P = np.vstack((np.ones((1, len(src_points))), src_points.T)).T
-    
-    # Assemble the linear system for the TPS parameters
-    L = np.block([[K, P], [P.T, np.zeros((3, 3))]])
-    
-    # Calculate the target displacements
-    target_displacements = np.vstack((dest_points, np.zeros((3, 2))))
-    
-    # Solve for the TPS parameters
-    params = solve(L, target_displacements, overwrite_a=True, overwrite_b=True)
-    
-    # Extract the affine and non-affine components
-    affine = params[-3:, :]
-    non_affine = params[:-3, :]
-
-     
-    # Define a function to apply the TPS transformation
-    def transform_point(point):
-        
-        affine_component = np.dot(affine.T, np.array([1, point[0], point[1]]))
-        # print(affine_component)
-        print(non_affine.shape)
-        # print(np.log(cdist(np.array([point]), src_points).squeeze()+ 1e-6).shape)
-
-        non_affine_component = np.sum(np.matmul(np.log(cdist(np.array([point]), src_points).squeeze() + 1e-6), non_affine))
-        transformed_point = point +  affine_component  #non_affine_component       # +
-        return transformed_point
-    
-    return transform_point
-
-
-
 class ImageSelector(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -236,6 +163,7 @@ class ImageSelector(QMainWindow):
         self.image2_path = None
         self.points_image1 = []
         self.points_image2 = []
+        self.selected_index = None
 
         self.setWindowTitle("Image Point Selector")
         self.setGeometry(100, 100, 1800, 1000)
@@ -250,23 +178,25 @@ class ImageSelector(QMainWindow):
         self.label1 = QLabel(self)
         self.label2 = QLabel(self)
 
-        #  # Create a scroll area
-        # self.scroll_area_1 = QScrollArea(self)
-        # self.scroll_area_1.setWidget(self.label1)
-        # self.scroll_area_1.setWidgetResizable(True)
+        self.title1 = QLabel("")
+        self.title1.setAlignment(Qt.AlignCenter)
+        self.title2 = QLabel("")
+        self.title2.setAlignment(Qt.AlignCenter)
 
-        # self.scroll_area_2 = QScrollArea(self)
-        # self.scroll_area_2.setWidget(self.label2)
-        # self.scroll_area_2.setWidgetResizable(True)
+        img1_layout = QVBoxLayout()
+        img1_layout.setContentsMargins(0, 0, 0, 0)
+        img1_layout.setSpacing(0)
+        img1_layout.addWidget(self.title1)
+        img1_layout.addWidget(self.label1)
 
-        # Set a fixed size for the QLabel
-        # self.label1.setFixedSize(800, 800)
-        # self.label2.setFixedSize(800, 800)
+        img2_layout = QVBoxLayout()
+        img2_layout.setContentsMargins(0, 0, 0, 0)
+        img2_layout.setSpacing(0)
+        img2_layout.addWidget(self.title2)
+        img2_layout.addWidget(self.label2)
 
-
-
-        image_layout.addWidget(self.label1)
-        image_layout.addWidget(self.label2)
+        image_layout.addLayout(img1_layout)
+        image_layout.addLayout(img2_layout)
         # self.layout.addLayout(image_layout)
         
         button_layout = QHBoxLayout()
@@ -287,6 +217,17 @@ class ImageSelector(QMainWindow):
         self.load_button3 = QPushButton("Delete points")
         self.load_button3.clicked.connect(self.delete)
         self.layout.addWidget(self.load_button3)
+
+        select_layout = QHBoxLayout()
+
+        self.select_mode_checkbox = QCheckBox("Select/Delete Landmark Mode")
+        select_layout.addWidget(self.select_mode_checkbox)
+
+        self.delete_selected_button = QPushButton("Delete Selected Landmark")
+        self.delete_selected_button.clicked.connect(self.delete_selected)
+        select_layout.addWidget(self.delete_selected_button)
+
+        self.layout.addLayout(select_layout)
 
 
         method_layout = QHBoxLayout()
@@ -341,12 +282,14 @@ class ImageSelector(QMainWindow):
 
         self.label1.setPixmap(pixmap_1)
         self.label1.setAlignment(Qt.AlignCenter)
+        self.title1.setText(Path(self.image1_path).name)
 
 
         # self.display_image(self.image1_path, self.label1)
         print("size",pixmap_1.size())
         self.label1.setFixedSize((pixmap_1.size()))
         self.points_image1 = []
+        self.selected_index = None
 
     def load_image2(self):
         options = QFileDialog.Options()
@@ -360,11 +303,13 @@ class ImageSelector(QMainWindow):
 
         self.label2.setPixmap(pixmap_2)
         self.label2.setAlignment(Qt.AlignCenter)
+        self.title2.setText(Path(self.image2_path).name)
 
 
         # self.display_image(self.image2_path, self.label2)
         self.label2.setFixedSize(pixmap_2.size())
         self.points_image2 = []
+        self.selected_index = None
 
     def load_landmarks(self):
         options = QFileDialog.Options()
@@ -372,8 +317,11 @@ class ImageSelector(QMainWindow):
         # print(_landmarks_file)
         _landmarks = np.load(_landmarks_file, allow_pickle=True)
         # print(_landmarks)
-        self.points_image1 = _landmarks[0]
-        self.points_image2 = _landmarks[1]
+        # np.load returns numpy arrays here, which lack .append()/.pop();
+        # convert to plain lists so loaded points behave like newly-added ones.
+        self.points_image1 = list(_landmarks[0])
+        self.points_image2 = list(_landmarks[1])
+        self.selected_index = None
 
         print(self.points_image1)
 
@@ -436,8 +384,8 @@ class ImageSelector(QMainWindow):
             bytesPerLine = 3 * width
             qImg2 = QImage(self.output_image.data, width, height, bytesPerLine, QImage.Format_BGR888).scaled(width // 2, height // 2, Qt.KeepAspectRatio)
 
-            dialog = ImageBlenderDialog(qImg1, qImg2)
-            dialog.exec_()
+            self.blender_dialog = ImageBlenderDialog(qImg1, qImg2, parent=self)
+            self.blender_dialog.show()
 
             # image_viewer = ImageViewer(qImg)
             # image_viewer.exec_()
@@ -469,8 +417,8 @@ class ImageSelector(QMainWindow):
             bytesPerLine = 3 * _width
             qImg2 = QImage(self.output_image.data, _width, _height, bytesPerLine, QImage.Format_BGR888)
 
-            dialog = ImageBlenderDialog(qImg1, qImg2)
-            dialog.exec_()
+            self.blender_dialog = ImageBlenderDialog(qImg1, qImg2, parent=self)
+            self.blender_dialog.show()
 
         else:
             print("\033[31mNumber of points selected on both images is not equal!\033[0m")
@@ -480,8 +428,13 @@ class ImageSelector(QMainWindow):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             if self.label1.underMouse() and self.image1_path:
-              
+
                 relative_pos = event.pos() - self.label1.pos()
+
+                if self.select_mode_checkbox.isChecked():
+                    self.selected_index = self.find_nearest_landmark(self.points_image1, relative_pos)
+                    self.redraw_landmarks()
+                    return
 
                 # label_width = self.label1.pixmap().width()
                 # label_height = self.label1.pixmap().height()
@@ -506,8 +459,14 @@ class ImageSelector(QMainWindow):
 
 
             elif self.label2.underMouse() and self.image2_path:
-                
+
                 relative_pos = event.pos() - self.label2.pos()
+
+                if self.select_mode_checkbox.isChecked():
+                    self.selected_index = self.find_nearest_landmark(self.points_image2, relative_pos)
+                    self.redraw_landmarks()
+                    return
+
                 self.points_image2.append(relative_pos)
 
                 painter2 = QPainter(self.label2.pixmap())
@@ -520,33 +479,31 @@ class ImageSelector(QMainWindow):
                 self.update()
         # print(self.points_image1, self.points_image2)
 
-    def drawMarks(self, label, color, landmarks):
+    def drawMarks(self, label, color, landmarks, selected_index=None):
         painter = QPainter(label.pixmap())
-       
+
         painter.setPen(Qt.NoPen)
-        painter.setBrush(color)
-        for item in landmarks:
+        for idx, item in enumerate(landmarks):
+            if idx == selected_index:
+                painter.setBrush(QColor(255, 255, 0))
+            else:
+                painter.setBrush(color)
             painter.drawEllipse(item, 5, 5)
         painter.end()
 
         self.update()
 
-    def delete(self):
-        # Remove the last selected point on both images
-        if len(self.points_image1) == len(self.points_image2):
-            if self.points_image1:
-                self.points_image1.pop()
-                self.update()
-            if self.points_image2:
-                self.points_image2.pop()
-                self.update()
-        elif (len(self.points_image1) > len(self.points_image2)):
-            self.points_image1.pop()
-            self.update()
-        elif (len(self.points_image1) < len(self.points_image2)):
-            self.points_image2.pop()
-            self.update()
+    def find_nearest_landmark(self, points, pos, threshold=10):
+        # Returns the index of the landmark within `threshold` pixels of pos, or None.
+        if not points:
+            return None
+        dists = [((p.x() - pos.x())**2 + (p.y() - pos.y())**2)**0.5 for p in points]
+        nearest_idx = int(np.argmin(dists))
+        if dists[nearest_idx] <= threshold:
+            return nearest_idx
+        return None
 
+    def redraw_landmarks(self):
         pixmap_1 = QPixmap(self.image1_path)
         half_width = pixmap_1.width() // sf1234
         half_height = pixmap_1.height() // sf1234
@@ -554,7 +511,7 @@ class ImageSelector(QMainWindow):
         self.label1.setPixmap(pixmap_1)
         self.label1.setAlignment(Qt.AlignCenter)
         self.label1.setFixedSize(pixmap_1.size())
-        self.drawMarks(self.label1, QColor(255,0,0), self.points_image1)
+        self.drawMarks(self.label1, QColor(255,0,0), self.points_image1, self.selected_index)
 
         pixmap_2 = QPixmap(self.image2_path)
         half_width = pixmap_2.width() // sf1234
@@ -564,8 +521,37 @@ class ImageSelector(QMainWindow):
         self.label2.setAlignment(Qt.AlignCenter)
         # self.display_image(self.image2_path, self.label2)
         self.label2.setFixedSize(pixmap_2.size())
-        self.drawMarks(self.label2, QColor(0,255,0), self.points_image2)
-        
+        self.drawMarks(self.label2, QColor(0,255,0), self.points_image2, self.selected_index)
+
+    def delete(self):
+        # Remove the last selected point on both images
+        if len(self.points_image1) == len(self.points_image2):
+            if self.points_image1:
+                self.points_image1.pop()
+            if self.points_image2:
+                self.points_image2.pop()
+        elif (len(self.points_image1) > len(self.points_image2)):
+            self.points_image1.pop()
+        elif (len(self.points_image1) < len(self.points_image2)):
+            self.points_image2.pop()
+
+        self.selected_index = None
+        self.redraw_landmarks()
+        print(self.points_image1, self.points_image2)
+
+    def delete_selected(self):
+        if self.selected_index is None:
+            print("No landmark selected.")
+            return
+
+        idx = self.selected_index
+        if idx < len(self.points_image1):
+            self.points_image1.pop(idx)
+        if idx < len(self.points_image2):
+            self.points_image2.pop(idx)
+
+        self.selected_index = None
+        self.redraw_landmarks()
         print(self.points_image1, self.points_image2)
 
 if __name__ == "__main__":

@@ -134,8 +134,8 @@ if __name__ == '__main__':
     output_dir = '/Users/jbonaventura/Desktop/Annotations'
 
     # --- Annotation config ---
-    mask_path = None  # set to TIFF output of WorkingGeoJson.py, or None to skip annotation labelling
-    #mask_path = '/Users/jbonaventura/Desktop/Annotations/HnE_R23-055_H7_7a_annotations_Mask.tiff'
+    #mask_path = None  # set to TIFF output of WorkingGeoJson.py, or None to skip annotation labelling
+    mask_path = '/Users/jbonaventura/Desktop/Annotations/HnE_R23-055_H7_7a_annotations_Mask.tiff'
     if mask_path is not None:
         # mask_labels values must match tisslabels dict in WorkingGeoJson.py; 0 = unannotated (Muscle)
         mask_labels = {0: 'Muscle', 100: 'Necrotic Tissue', 200: 'Immune Infiltration'}
@@ -177,7 +177,7 @@ if __name__ == '__main__':
         splines = ski.transform.ThinPlateSplineTransform.from_estimate(src, dst)
         splines_inv = ski.transform.ThinPlateSplineTransform.from_estimate(dst, src)
 
-        CZI_filepath = CSZ_CZI_lookup(RabbitID, f'Block{Block:02d}', img_number)
+        CZI_filepath = CSV_CZI_lookup(RabbitID, f'Block{Block:02d}', img_number)
         slide_id = os.path.splitext(os.path.basename(CZI_filepath))[0]
         print(slide_id)
         output_csv_path = os.path.join(output_dir, f'{slide_id}_features.csv')  #New csv and geojson files for each HnE slide

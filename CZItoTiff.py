@@ -9,8 +9,8 @@ import math
 import ast
 
 #Now to add pointing so we can go from rabbit number and block to all of this-
-rab_ID='R24-058'
-block_no='block08'
+rab_ID='R24-101'
+block_no='block12'
 
 # #Path to Savepoint-
 BaseSavePath="//System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData"
@@ -39,7 +39,7 @@ for i in range(csv_array.shape[0]):
 match_array = np.array(match_vals)
 
 #Path to CZI directory-
-czi_dirpath=os.path.join(BaseCephPath, rab_ID, rab_ID + "_HnE_5x", block_no)
+czi_dirpath=os.path.join(BaseCephPath, rab_ID, rab_ID + "_HnE_5X", block_no)
 for file in os.listdir(czi_dirpath):
     print(file)
     #Can edit for funky naming stuff that may go on-
@@ -62,8 +62,8 @@ for file in os.listdir(czi_dirpath):
 
         bbox = czifile.get_mosaic_bounding_box()
         czi_img = czifile.read_mosaic(C=0, scale_factor=1/20, region=(bbox.x, bbox.y, bbox.w, bbox.h), background_color=(1,1,1))[0,:,:,:]
-        plt.imshow(czi_img)
-        plt.show()
+        # plt.imshow(czi_img)
+        # plt.show()
 
         #Save Image as Tiff-
         new_file_path = os.path.join(save_dirpath, "HnE_IMG_"+ image_tag + ".tif")

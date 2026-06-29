@@ -1,7 +1,39 @@
 import os
 import re
+import glob
 import numpy as np
 import pandas as pd
+import cv2
+from scipy.ndimage import label, binary_opening, binary_closing
+
+
+def make_tissue_mask(img_rgb, sat_threshold=30, min_component_area=500,
+                     morph_open_radius=3, morph_close_radius=10):
+    # Convert to HSV and pull the saturation channel — tissue is stained (high sat),
+    # background and debris are near-white (low sat)
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+
+    # Threshold saturation to get an initial binary tissue mask
+    binary = (sat > sat_threshold).astype(np.uint8)
+
+    # Morphological opening — erode then dilate, removes small isolated noise specks
+    open_struct = np.ones((morph_open_radius, morph_open_radius), dtype=bool)
+    binary = binary_opening(binary, structure=open_struct).astype(np.uint8)
+
+    # Morphological closing — dilate then erode, fills small holes within tissue regions
+    close_struct = np.ones((morph_close_radius, morph_close_radius), dtype=bool)
+    binary = binary_closing(binary, structure=close_struct).astype(np.uint8)
+
+    # Label connected components and discard anything smaller than min_component_area —
+    # eliminates debris and tiling artifacts that survived the morphological steps
+    labeled, _ = label(binary)
+    component_sizes = np.bincount(labeled.ravel())
+    keep = np.where(component_sizes >= min_component_area)[0]
+    keep = keep[keep != 0]  # label 0 is background
+    mask = np.isin(labeled, keep).astype(np.uint8)
+
+    return mask
 
 
 def tiling_tool(twoDIm, tile_size):
@@ -70,8 +102,11 @@ def CSV_CZI_lookup(rab_ID, block, file_numb):
     df = pd.read_csv(csv_filepath, header=None)
     row = df[df.iloc[:, 0].str.contains(file_numb)]
     czi_name = row.iloc[0, 2].split(';')[0]
-    # Path to CZI directory-
-    czi_dirpath = os.path.join(BaseCephPath, rab_ID, rab_ID + "_HnE_5x", block_no)
+    # Path to CZI directory — glob to handle case variants (e.g. _HnE_5x vs _HnE_5X)
+    hne_candidates = glob.glob(os.path.join(BaseCephPath, rab_ID, rab_ID + "_HnE_*"))
+    if not hne_candidates:
+        raise FileNotFoundError(f"No HnE directory found for {rab_ID} in {BaseCephPath}")
+    czi_dirpath = os.path.join(hne_candidates[0], block_no)
     czi_file = next(f for f in os.listdir(czi_dirpath) if re.search(r'(?<!\d)' + re.escape(czi_name), f))
     czi_path = os.path.join(czi_dirpath, czi_file)
     return czi_path

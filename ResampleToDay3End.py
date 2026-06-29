@@ -23,6 +23,8 @@ import nibabel as nib
 import SimpleITK as sitk
 from scipy.ndimage import map_coordinates
 import csv
+import cv2
+import matplotlib.pyplot as plt
 from ApplyTransforms import ApplySlicerTransform, propagate_tiles_to_day0
 
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
@@ -31,7 +33,7 @@ os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 # Paths — edit these two lines per rabbit
 # ---------------------------------------------------------------------------
 RABBIT_FOLDER = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RABBIT_ID     = 'R23-055'
+RABBIT_ID     = 'R24-103'
 
 _base     = os.path.join(RABBIT_FOLDER, RABBIT_ID, 'InVivo_MR', 'InVMRDataSets')
 DAY3_DIR  = os.path.join(_base, 'Day3')
@@ -50,16 +52,13 @@ def _load_day3_log(day3_dir, rabbit_id):
         for row in csv.DictReader(f):
             key = row['Home'].strip()
             val = os.path.join(day3_dir, row['File Name'].strip() + '.nii.gz')
+            if key == 'Skip':
+                print(f"  Skipping (flagged): {os.path.basename(val)}")
             roles.setdefault(key, []).append(val)
     return roles
 
-_day3 = _load_day3_log(DAY3_DIR, RABBIT_ID)
-
-DAY3_END_PATH     = _day3['End'][0]
-DAY3_START_STRUCT = _day3['Fixed'][0]
-DAY3_START_EXTRA  = _day3.get('Start', [])
-print("Day3 Extras- ", DAY3_START_EXTRA)
-
+_fwd_matches      = glob.glob(os.path.join(DAY3_DIR, '*.h5'))
+SLICER_FWD_PATH   = _fwd_matches[0] if _fwd_matches else None
 SLICER_INV_CACHE  = os.path.join(DAY3_DIR, 'Day3_end_to_start_inv_cached.h5')
 AFFINE_FIELD_PATH = os.path.join(XFMS_DIR, 'Affine_deformation.npy')
 SPLINES_FIELD_PATH= os.path.join(XFMS_DIR, 'SplinesProjection.npy')
@@ -77,6 +76,18 @@ APS_INV_METHOD = 'fixedpoint'
 
 # Interpolation order for resampling: 1=linear, 0=nearest neighbour
 INTERP_ORDER = 1
+
+# ---------------------------------------------------------------------------
+# Masking config
+# ---------------------------------------------------------------------------
+# Set APPLY_MASK=False to skip masking entirely and save raw registered volumes.
+# Set RETUNE_MASK=True to interactively tune parameters before each run.
+# Set RETUNE_MASK=False to use the values below directly (no prompts).
+APPLY_MASK      = True
+RETUNE_MASK     = True
+MASK_THRESH     = 10
+MASK_MASKTHRESH = 150
+MASK_KERNSIZE   = 15
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +245,61 @@ def _build_aps_inverse_sitk(day0_nib, day3_start_nib, affine_field, splines_fiel
 
 
 # ---------------------------------------------------------------------------
+# Grid resampling (no transform)
+# ---------------------------------------------------------------------------
+
+def resample_to_grid(path, reference_sitk, interpolator=sitk.sitkLinear):
+    """Resample a volume onto the reference grid using an identity transform."""
+    moving = sitk.ReadImage(path)
+    resampled = sitk.Resample(moving, reference_sitk, sitk.Transform(),
+                              interpolator, 0.0, moving.GetPixelID())
+    return sitk.GetArrayFromImage(resampled).transpose(2, 1, 0)
+
+
+# ---------------------------------------------------------------------------
+# Masking
+# ---------------------------------------------------------------------------
+
+def build_body_mask(vol_arr, thresh, maskthresh, kernsize):
+    if np.max(vol_arr) == 0:
+        return np.zeros(vol_arr.shape, dtype=bool)
+    pic = np.array(vol_arr / np.max(vol_arr) * 255).astype(np.uint8)
+    thresh_pic = np.where(pic > thresh, 1000, pic).astype(np.float32)
+    kernel = np.ones((kernsize, kernsize), np.float32) / (kernsize * kernsize)
+    filtered = np.zeros(thresh_pic.shape, dtype=np.float32)
+    for k in range(thresh_pic.shape[2]):
+        filtered[:, :, k] = cv2.filter2D(thresh_pic[:, :, k], ddepth=-1, kernel=kernel)
+    return filtered > maskthresh
+
+
+def tune_mask_interactively(vol_arr, thresh, maskthresh, kernsize):
+    while True:
+        mask = build_body_mask(vol_arr, thresh, maskthresh, kernsize)
+        mid = [s // 2 for s in vol_arr.shape]
+        pic = np.array(vol_arr / np.max(vol_arr) * 255).astype(np.uint8)
+        fig, axs = plt.subplots(2, 3, figsize=(12, 8))
+        for col, (sl_img, sl_mask) in enumerate([
+            (pic[mid[0], :, :], mask[mid[0], :, :]),
+            (pic[:, mid[1], :], mask[:, mid[1], :]),
+            (pic[:, :, mid[2]], mask[:, :, mid[2]]),
+        ]):
+            axs[0, col].imshow(sl_img, cmap='gray')
+            axs[1, col].imshow(sl_img * sl_mask, cmap='gray')
+        plt.suptitle(f'thresh={thresh}  maskthresh={maskthresh}  kernsize={kernsize}'
+                     f'\nTop: original    Bottom: masked')
+        plt.tight_layout()
+        plt.show()
+        if input('Accept mask? (y/n): ').strip().lower() == 'y':
+            return mask, thresh, maskthresh, kernsize
+        val = input(f'  thresh [{thresh}]: ').strip()
+        thresh = float(val) if val else thresh
+        val = input(f'  maskthresh [{maskthresh}]: ').strip()
+        maskthresh = float(val) if val else maskthresh
+        val = input(f'  kernsize [{kernsize}]: ').strip()
+        kernsize = int(val) if val else kernsize
+
+
+# ---------------------------------------------------------------------------
 # Core: build dense Day3_end → Day0 displacement field
 # ---------------------------------------------------------------------------
 
@@ -268,9 +334,12 @@ def build_day3end_to_day0_field(day3_end_nib, day3_start_nib, inv_composite,
     day3start_ras = _apply_slicer_inv_vectorized(phys_ras, inv_composite).astype(np.float32)
     del phys_ras
 
-    # Physical RAS → Day3_start voxel (0-indexed)
+    # Physical RAS → APS voxel (0-indexed).
+    # The APS fields live in Day3_end/Day0 orientation (384, 144, 512).
+    # Day3_start NIfTI has Y and Z swapped (384, 512, 144), so using its affine
+    # here would put coordinates into the wrong axis ordering for the APS fields.
     hom            = np.column_stack([day3start_ras, np.ones(N, dtype=np.float32)])
-    day3start_vox  = (np.linalg.inv(day3_start_nib.affine) @ hom.T).T[:, :3].astype(np.float32)
+    day3start_vox  = (np.linalg.inv(day3_end_nib.affine) @ hom.T).T[:, :3].astype(np.float32)
     del day3start_ras, hom
 
     if APS_INV_METHOD == 'sitk':
@@ -288,20 +357,12 @@ def build_day3end_to_day0_field(day3_end_nib, day3_start_nib, inv_composite,
         ]).astype(np.float32)
 
     else:  # fixedpoint
-        field_bounds = np.array([383., 143., 511.])
-        in_bounds = np.all((day3start_vox >= 0) & (day3start_vox <= field_bounds), axis=1)
-        n_in = in_bounds.sum()
-        print(f"  {n_in:,} / {N:,} voxels in Day0 field bounds — masking the rest to -1")
-
-        day0_vox = np.full((N, 3), -1., dtype=np.float32)
-        if n_in > 0:
-            print(f"  Inverting Amanpreet fields ({n_iter} iterations, alpha={alpha})...")
-            print(day3start_vox.shape)
-            day0_vox[in_bounds] = propagate_tiles_to_day0(
-                day3start_vox[in_bounds].reshape(1, n_in, 3).astype(np.float64),
-                affine_field, splines_field, sdiff_field,
-                n_iter=n_iter, alpha=alpha, verbose=True
-            ).reshape(n_in, 3).astype(np.float32)
+        print(f"  Inverting Amanpreet fields ({n_iter} iterations, alpha={alpha})...")
+        day0_vox = propagate_tiles_to_day0(
+            day3start_vox.reshape(1, N, 3).astype(np.float64),
+            affine_field, splines_field, sdiff_field,
+            n_iter=n_iter, alpha=alpha, verbose=True
+        ).reshape(N, 3).astype(np.float32)
 
     return day0_vox.reshape(X, Y, Z, 3)
 
@@ -327,10 +388,70 @@ def resample_with_field(vol_arr, voxel_field, order=1):
 if __name__ == '__main__':
     os.makedirs(OUT_DIR, exist_ok=True)
 
+    _day3 = _load_day3_log(DAY3_DIR, RABBIT_ID)
+    DAY3_END_PATH     = _day3['End'][0]
+    DAY3_START_STRUCT = _day3['Fixed'][0]
+    DAY3_START_EXTRA  = _day3.get('Start', [])
+    print("Day3 Extras- ", DAY3_START_EXTRA)
+
     day3_end_nib   = nib.load(DAY3_END_PATH)
     print(DAY3_END_PATH)
     day3_start_nib = nib.load(DAY3_START_STRUCT)
-    inv_composite  = _load_transform(SLICER_INV_CACHE)
+    if os.path.exists(SLICER_INV_CACHE):
+        print('Loading cached inverse transform...')
+        try:
+            inv_composite = _load_transform(SLICER_INV_CACHE)
+        except RuntimeError:
+            print('  Cache file corrupt — rebuilding...')
+            os.remove(SLICER_INV_CACHE)
+            inv_composite = None
+    else:
+        inv_composite = None
+
+    if inv_composite is None:
+        if not SLICER_FWD_PATH:
+            raise FileNotFoundError(f"No .h5 transform found in {DAY3_DIR}")
+        print(f'Building inverse transform from {os.path.basename(SLICER_FWD_PATH)} (will be cached)...')
+        fwd_composite = sitk.CompositeTransform(_load_transform(SLICER_FWD_PATH))
+        affine        = fwd_composite.GetNthTransform(0)
+        disp_t        = sitk.DisplacementFieldTransform(fwd_composite.GetNthTransform(1))
+
+        aff_params = np.array(affine.GetParameters())
+        M_inv      = np.linalg.inv(aff_params[:9].reshape(3, 3))
+        t_inv      = -M_inv @ aff_params[9:]
+        inv_affine = sitk.AffineTransform(3)
+        inv_affine.SetFixedParameters(affine.GetFixedParameters())
+        inv_affine.SetParameters(list(M_inv.flatten()) + list(t_inv))
+
+        print('  Inverting displacement field...')
+        inv_disp_t = sitk.DisplacementFieldTransform(
+            sitk.InvertDisplacementField(disp_t.GetDisplacementField())
+        )
+
+        inv_composite = sitk.CompositeTransform(3)
+        inv_composite.AddTransform(inv_disp_t)
+        inv_composite.AddTransform(inv_affine)
+
+        with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            sitk.WriteTransform(inv_composite, tmp_path)
+            shutil.copy2(tmp_path, SLICER_INV_CACHE)
+        finally:
+            os.unlink(tmp_path)
+        print(f'  Cached → {SLICER_INV_CACHE}')
+
+    # --- Build body mask from Day3_end structural ---
+    if APPLY_MASK:
+        day3_end_arr = day3_end_nib.get_fdata(dtype=np.float32)
+        if RETUNE_MASK:
+            mask, MASK_THRESH, MASK_MASKTHRESH, MASK_KERNSIZE = tune_mask_interactively(
+                day3_end_arr, MASK_THRESH, MASK_MASKTHRESH, MASK_KERNSIZE
+            )
+        else:
+            mask = build_body_mask(day3_end_arr, MASK_THRESH, MASK_MASKTHRESH, MASK_KERNSIZE)
+        print(f'  Body mask built: {mask.sum():,} voxels retained')
+        del day3_end_arr
 
     # --- Day3_start extras → Day3_end (Slicer only) ---
     for path in DAY3_START_EXTRA:
@@ -351,6 +472,24 @@ if __name__ == '__main__':
         print(f"  unique values sample: {np.unique(arr[arr > 0])[:20]}")
         print(f"  min step: {np.diff(np.unique(arr[arr > 0])).min():.6f}")
 
+        if APPLY_MASK:
+            arr = arr * mask
+        nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
+        print(f"  Saved → {out}")
+
+    # --- End_native volumes → Day3_end grid (identity resample only) ---
+    day3_end_sitk = sitk.ReadImage(DAY3_END_PATH)
+    _interp = {0: sitk.sitkNearestNeighbor, 1: sitk.sitkLinear}[INTERP_ORDER]
+    for path in _day3.get('End_native', []):
+        if not os.path.exists(path):
+            print(f"Skipping (not found): {path}")
+            continue
+        stem = os.path.basename(path).replace('.nii.gz', '')
+        out  = os.path.join(OUT_DIR, f'{stem}_regToDay3End.nii.gz')
+        print(f"Resampling {stem} → Day3_end grid (no transform) ...")
+        arr = resample_to_grid(path, day3_end_sitk, interpolator=_interp)
+        if APPLY_MASK:
+            arr = arr * mask
         nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
         print(f"  Saved → {out}")
 
@@ -366,8 +505,7 @@ if __name__ == '__main__':
         print("Building Day3_end → Day0 displacement field (one-time cost) ...")
         voxel_field = build_day3end_to_day0_field(
             day3_end_nib, day3_start_nib, inv_composite,
-            affine_field, splines_field, sdiff_field,
-            n_iter=10
+            affine_field, splines_field, sdiff_field
         )
         np.save(DISPLACEMENT_CACHE, voxel_field)
         print(f"  Cached → {DISPLACEMENT_CACHE}")
@@ -380,6 +518,8 @@ if __name__ == '__main__':
         print(f"Resampling Day0/{stem} → Day3_end ...")
         vol_arr = nib.load(path).get_fdata(dtype=np.float32)
         arr     = resample_with_field(vol_arr, voxel_field, order=INTERP_ORDER)
+        if APPLY_MASK:
+            arr = arr * mask
         nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
         print(f"  Saved → {out}")
 

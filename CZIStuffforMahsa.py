@@ -112,6 +112,34 @@ def label_tile_from_mask(mask, tformed_quad, mask_labels, mask_ds=20, threshold=
 
     return mask_labels.get(int(values[dominant_idx]), None)
 
+
+def tile_class_composition(mask, tformed_quad, mask_labels, mask_ds=20):
+    """
+    Compute the fraction of each annotated class within a tile's footprint
+    in the annotation mask. Returns a dict mapping class name -> fraction
+    (fractions sum to ~1), or None if the tile falls entirely outside the mask.
+
+    tformed_quad: (4, 2) array of tile corners in full-resolution CZI pixel space [row, col]
+    mask: 2D uint8 array in CZI/mask_ds pixel space
+    mask_labels: dict mapping mask integer values to class name strings
+    """
+    r_min, c_min = (tformed_quad.min(axis=0) / mask_ds).astype(int)
+    r_max, c_max = (tformed_quad.max(axis=0) / mask_ds).astype(int)
+
+    r_min = max(0, r_min)
+    c_min = max(0, c_min)
+    r_max = min(mask.shape[0], r_max)
+    c_max = min(mask.shape[1], c_max)
+
+    tile_region = mask[r_min:r_max, c_min:c_max]
+    if tile_region.size == 0:
+        return None
+
+    values, counts = np.unique(tile_region, return_counts=True)
+    total = tile_region.size
+    return {mask_labels.get(int(v), f'unknown_{int(v)}'): c / total for v, c in zip(values, counts)}
+
+
 if __name__ == '__main__':
     RabbitFolder = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
     RabbitID     = "R23-055"
@@ -126,9 +154,9 @@ if __name__ == '__main__':
     #Change to whatevers convenient to you-
     output_dir = '/Users/jbonaventura/Desktop/Annotations'
 
-    # --- Annotation config --- #Probs not yet but know
-    mask_path = None  # set to TIFF output of WorkingGeoJson.py, or None to skip annotation labeling
-    #mask_path = '/Users/jbonaventura/Desktop/Annotations/HnE_R23-055_H7_7a_annotations_Mask.tiff'
+    # --- Annotation config ---
+    #mask_path = None  # set to TIFF output of WorkingGeoJson.py, or None to skip annotation labeling
+    mask_path = '/Users/jbonaventura/Desktop/Annotations/HnE_R23-055_H7_7a_annotations_Mask.tiff'
     if mask_path is not None:
         # mask_labels values must match tisslabels dict in WorkingGeoJson.py; 0 = unannotated (Muscle)
         mask_labels = {0: 'Muscle', 100: 'Necrotic Tissue', 200: 'Immune Infiltration'}
@@ -145,7 +173,7 @@ if __name__ == '__main__':
     reg_HnE_arr = np.stack(hne_images, axis=2)  # (H, W, N_slices, 3)
 
     tilesize = 300
-    for img in range(len(hne_filenames)):
+    for img in range(1):
         #To just work with one at a time->
         img=5
         hne_ds_im= reg_HnE_arr[:,:,img,:]
@@ -167,6 +195,7 @@ if __name__ == '__main__':
         #Some autopath generation for saving features and tiles if you want that->
         output_csv_path = os.path.join(output_dir, f'{slide_id}_features.csv')  #New csv and geojson files for each HnE slide
         output_geojson_path = os.path.join(output_dir, f'{slide_id}_tiles.geojson')
+        output_tile_labels_csv_path = os.path.join(output_dir, f'{slide_id}_tile_labels.csv')
 
         #Use blockface filename position in CroppedImages to find the correct NIfTI slice-
         #May not be applicable yet but will be used to relate back to MR data->
@@ -177,53 +206,53 @@ if __name__ == '__main__':
         bbox = czifile.get_mosaic_bounding_box()
 
         print("bboxes",bbox.x, bbox.y)
-        # If we want to look at a downsampled CZI file- useful for verifying splines transform is acting how we want-
-        newscale=1/10
-        sf=newscale/(1/20)
-        print("sf",sf)
-        czi_img = czifile.read_mosaic(C=0, scale_factor=newscale, region=(bbox.x, bbox.y, bbox.w, bbox.h))[0]
-        czi_img[:, :, [0, 2]] = czi_img[:, :, [2, 0]]  #Swap color channels for RGB vs BGR conventions
-        plt.imshow(czi_img)
-        plt.show()
-
-        output_image1 = ski.transform.warp(hne_ds_im, splines_inv, output_shape=(czi_img.shape[0]/sf, czi_img.shape[1]/sf, czi_img.shape[2]))
-        output_image1 = (output_image1 / np.max(output_image1) * 255).astype(np.uint8)
-
-        #Need to rescale splines for different sized CZI's->
-        srcrs = np.array([[p.x(), p.y()] for p in landmarks[0]])*3*sf  # fixed
-        dstrs = np.array([[p.x(), p.y()] for p in landmarks[1]])*3*sf  # H&E
-        splinesrs = ski.transform.ThinPlateSplineTransform.from_estimate(srcrs, dstrs)
-
-        output_image2 = ski.transform.warp(czi_img, splinesrs, output_shape=(hne_ds_im.shape[0]*sf, hne_ds_im.shape[1]*sf,hne_ds_im.shape[2]))
-        # normalize and convert to uint8
-        output_image2 = (output_image2 / np.max(output_image2) * 255).astype(np.uint8)
-
-        fig, axes = plt.subplots(2, 2)
-        axes[0,0].imshow(hne_ds_im)
-        axes[0,0].set_title('Hne BF Reg Image')
-        axes[0,1].imshow(output_image1)
-        axes[0,1].set_title('BF Reg Image inv splines to ds and unreg hne')
-        axes[1,0].imshow(czi_img)
-        axes[1,0].set_title('Hne CZI from File')
-        axes[1,1].imshow(output_image2)
-        axes[1,1].set_title('HnE splines to bf')
-        plt.tight_layout()
-        plt.show()
-
-        #Showing Tiles over slices in blockface space->
-        fig, axes = plt.subplots(1, 1)
-        axes.imshow(hne_ds_im)
-        for q in range(len(origin_list)):
-            row = origin_list[q,0]
-            col = origin_list[q,1]
-            color = 'black'
-            rect = patches.Rectangle(
-                (col, row),  # note: matplotlib uses (x, y) = (col, row)
-                tilesize, tilesize,
-                linewidth=1, edgecolor=color, facecolor='none'
-            )
-            axes.add_patch(rect)
-        plt.show()
+        # # If we want to look at a downsampled CZI file- useful for verifying splines transform is acting how we want-
+        # newscale=1/10
+        # sf=newscale/(1/20)
+        # print("sf",sf)
+        # czi_img = czifile.read_mosaic(C=0, scale_factor=newscale, region=(bbox.x, bbox.y, bbox.w, bbox.h))[0]
+        # czi_img[:, :, [0, 2]] = czi_img[:, :, [2, 0]]  #Swap color channels for RGB vs BGR conventions
+        # plt.imshow(czi_img)
+        # plt.show()
+        #
+        # output_image1 = ski.transform.warp(hne_ds_im, splines_inv, output_shape=(czi_img.shape[0]/sf, czi_img.shape[1]/sf, czi_img.shape[2]))
+        # output_image1 = (output_image1 / np.max(output_image1) * 255).astype(np.uint8)
+        #
+        # #Need to rescale splines for different sized CZI's->
+        # srcrs = np.array([[p.x(), p.y()] for p in landmarks[0]])*3*sf  # fixed
+        # dstrs = np.array([[p.x(), p.y()] for p in landmarks[1]])*3*sf  # H&E
+        # splinesrs = ski.transform.ThinPlateSplineTransform.from_estimate(srcrs, dstrs)
+        #
+        # output_image2 = ski.transform.warp(czi_img, splinesrs, output_shape=(hne_ds_im.shape[0]*sf, hne_ds_im.shape[1]*sf,hne_ds_im.shape[2]))
+        # # normalize and convert to uint8
+        # output_image2 = (output_image2 / np.max(output_image2) * 255).astype(np.uint8)
+        #
+        # fig, axes = plt.subplots(2, 2)
+        # axes[0,0].imshow(hne_ds_im)
+        # axes[0,0].set_title('Hne BF Reg Image')
+        # axes[0,1].imshow(output_image1)
+        # axes[0,1].set_title('BF Reg Image inv splines to ds and unreg hne')
+        # axes[1,0].imshow(czi_img)
+        # axes[1,0].set_title('Hne CZI from File')
+        # axes[1,1].imshow(output_image2)
+        # axes[1,1].set_title('HnE splines to bf')
+        # plt.tight_layout()
+        # plt.show()
+        #
+        # #Showing Tiles over slices in blockface space->
+        # fig, axes = plt.subplots(1, 1)
+        # axes.imshow(hne_ds_im)
+        # for q in range(len(origin_list)):
+        #     row = origin_list[q,0]
+        #     col = origin_list[q,1]
+        #     color = 'black'
+        #     rect = patches.Rectangle(
+        #         (col, row),  # note: matplotlib uses (x, y) = (col, row)
+        #         tilesize, tilesize,
+        #         linewidth=1, edgecolor=color, facecolor='none'
+        #     )
+        #     axes.add_patch(rect)
+        # plt.show()
 
         # Build (N_tiles, 4, 2) corner array in [row, col] and propagate all tiles at once to other spaces-
         rows = origin_list[:, 0]
@@ -243,6 +272,7 @@ if __name__ == '__main__':
         #Tile-Wise work through-
         transformed_originList=[]
         tile_render_data = []
+        records = []
         for tile in range(len(origin_list)):
         #for tile in range(3):
             O_up = origin_list[tile]
@@ -281,6 +311,15 @@ if __name__ == '__main__':
                     continue
                 record.update(hne_features)
 
+            if mask is not None:
+                composition = tile_class_composition(mask, tformed_quad, mask_labels)
+                for class_name in mask_labels.values():
+                    record[f'pct_{class_name}'] = (
+                        composition.get(class_name, 0.0) if composition is not None else None
+                    )
+
+            records.append(record)
+
             #Masking to only get polygon->
             verticies = tformed_quad[:,::-1].copy()
             verticies -= [c_min, r_min]
@@ -309,3 +348,8 @@ if __name__ == '__main__':
         # To save tile origins to pull into qupath->
         # originarray= np.array(transformed_originList)
         # tiles_to_geojson(originarray, output_geojson_path)
+
+        if records:
+            tile_labels_df = pd.DataFrame(records)
+            tile_labels_df.to_csv(output_tile_labels_csv_path, index=False)
+            print(f'Saved {len(tile_labels_df)} tile locations with annotation class composition to {output_tile_labels_csv_path}')

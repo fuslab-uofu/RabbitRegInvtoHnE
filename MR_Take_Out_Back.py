@@ -7,7 +7,7 @@ from scipy.ndimage import label, binary_fill_holes
 
 
 #Import template image-
-temp_path = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/InVivo_MR/InVMRDataSets/Day0/T1wCE.nii.gz"
+temp_path = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R24-103/InVivo_MR/InVMRDataSets/Day0/T1wCE.nii.gz"
 tempvol = nib.load(temp_path).get_fdata()
 print(tempvol.shape)
 
@@ -45,7 +45,7 @@ print('Saved testout.nii.gz')
 import os
 from pathlib import Path
 
-data_dir = Path('/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055/InVivo_MR/InVMRDataSets/Day0')
+data_dir = Path('/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R24-103/InVivo_MR/InVMRDataSets/Day0')
 out_dir = Path('/Users/jbonaventura/Desktop/TestOutputs')
 
 for nii_file in sorted(data_dir.glob('*.nii.gz')):

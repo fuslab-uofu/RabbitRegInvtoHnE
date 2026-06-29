@@ -1,5 +1,6 @@
 #Import libraries-
 import os
+import SimpleITK as sitk
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # required for network filesystems (ceph, NFS)
 import numpy as np
 import nibabel as nib
@@ -13,7 +14,7 @@ from PIL import Image
 
 def PrepForLandMarker(movingimpath, fixedimpath, SlicerTPath, output_dir,
                       moving_stage, fixed_stage, Block=None, processing=None,
-                      fixed_output_dir=None):
+                      fixed_output_dir=None, interpolator=sitk.sitkLinear):
     """
     Part 1: Apply Slicer rigid transform, resample moving into fixed space,
     canonicalize, and save as .nii.gz ready for LandMarker.
@@ -27,7 +28,7 @@ def PrepForLandMarker(movingimpath, fixedimpath, SlicerTPath, output_dir,
     warn_if_oblique(fixedimpath)
 
     # Resample moving into fixed image space
-    resampled = ApplySlicerTransform(str(movingimpath), str(fixedimpath), str(SlicerTPath))
+    resampled = ApplySlicerTransform(str(movingimpath), str(fixedimpath), str(SlicerTPath), interpolator=interpolator)
 
     # Canonicalize to match LandMarker's convention
     fixed_nib = nib.load(str(fixedimpath))
@@ -156,7 +157,7 @@ def MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder):
 
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R23-055"
-Block = 7
+RabbitID="R24-082"
+Block = 5
 
 MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder)

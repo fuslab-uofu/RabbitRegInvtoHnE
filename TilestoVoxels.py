@@ -23,7 +23,7 @@ from skimage.color import rgb2gray
 from skimage.measure import block_reduce
 import torch
 from PIL import Image
-from TileUtils import tiling_tool, load_landmarks, get_bf_slice_index, CSV_CZI_lookup
+from TileUtils import make_tissue_mask, load_landmarks, get_bf_slice_index, CSV_CZI_lookup
 from shapely.geometry import Polygon
 from HnEFeatureExtraction import extract_features
 
@@ -45,9 +45,9 @@ def rectilinearize(pts, edge_map):
     return np.array(result)
 
 if __name__ == '__main__':
-    Rabbit = 'R23-055'
-    block_no = 7
-    Block = 'Block0' + str(block_no)
+    Rabbit = 'R24-103'
+    block_no = 6
+    Block = f'Block{block_no:02d}'
     #Need this one to draw tiles-
     #Need to call directory instead of niftis->
     root_dir = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
@@ -57,7 +57,7 @@ if __name__ == '__main__':
     #Change here to change (Should work with any of the niftis registered to BlockFace)-
     reg_HnE_dir = os.path.join(hne_base_dir, 'Registered')
     #Path to voxel map-
-    reg_show = os.path.join(rabbase, 'InVivo_MR/RegDataOut/Voxel_Maps/voxel_tile_vol_reg_to_'+Block+'.nii.gz')
+    reg_show = os.path.join(rabbase, 'InVivo_MR/RegDataProc/Voxel_Maps/voxel_tile_vol_RegTo'+Block+'.nii.gz')
 
     bf_cropped_dir = os.path.join(rabbase, 'BlockFace_RGB', Block,'CroppedImages')
     print(bf_cropped_dir)
@@ -91,6 +91,7 @@ if __name__ == '__main__':
     print(hne_bf_indices[0])
 
     Save_Voxel_Geoms = True
+    Show_Plots = True
 
     tilesize=50
     chunk_size_ds = 200   # non-overlapping chunk size in downsampled HnE pixels
@@ -99,7 +100,7 @@ if __name__ == '__main__':
     features_dir = os.path.join(rabbase, 'Analysis', Block)
     os.makedirs(features_dir, exist_ok=True)
 
-    for img in range(6):
+    for img in range(len(hne_filenames)):
         all_results = []
         #i=5
         hne_ds_im= reg_HnE_arr[:,:,img,:]
@@ -129,36 +130,36 @@ if __name__ == '__main__':
 
         print(hne_ds_im.shape, MR_Slice_us.shape)
 
-        origin_list = tiling_tool(reg_HnE_arr[:,:,img,:], tilesize)
-        tile_mask = np.zeros(MR_Slice_us.shape[:2], dtype=np.uint8)
-        for origin in origin_list:
-            row, col = origin
-            tile_mask[row:row + tilesize, col:col + tilesize] = 1
+        tile_mask = make_tissue_mask(reg_HnE_arr[:, :, img, :])
 
-        n_cols = 1 + len(mr_volumes)
+        n_cols = 2 + len(mr_volumes)
         fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 8))
         axes[0].imshow(hne_ds_im)
-        axes[0].contour(tile_mask, levels=[0.5], colors='white', linewidths=0.5)
         axes[0].set_title('H&E', fontsize=8)
         axes[0].axis('off')
-        for ax, (vol_name, vol_arr) in zip(axes[1:], mr_volumes.items()):
+        axes[1].imshow(hne_ds_im * tile_mask[:, :, np.newaxis])
+        axes[1].set_title('Tissue mask applied', fontsize=8)
+        axes[1].axis('off')
+        for ax, (vol_name, vol_arr) in zip(axes[2:], mr_volumes.items()):
             _slice = vol_arr[:, :, slice_num].T
             _us = np.repeat(np.repeat(_slice, 4, axis=0), 4, axis=1)
             _us = _us[:hne_ds_im.shape[0], :hne_ds_im.shape[1]]
             ax.imshow(_us, cmap='gray')
-            ax.contour(tile_mask, levels=[0.5], colors='white', linewidths=0.5)
             ax.set_title(vol_name, fontsize=8)
             ax.axis('off')
         plt.suptitle(f'Slice {hne_Name}')
         plt.tight_layout(pad=1)
-        plt.show()
+        if Show_Plots:
+            plt.show()
+        plt.close()
 
 
         #Convert  MR to Gradient space-
+        valid_mask = (MR_Slice_us > 0).astype(np.uint8)
         dy, dx = np.gradient(MR_Slice_us.astype(float))
         edge_map = (np.abs(np.sign(dy)) + np.abs(np.sign(dx))).astype(float)
         interior = (~(edge_map > 0)).astype(np.uint8)
-        interior_masked = interior & tile_mask
+        interior_masked = interior & tile_mask & valid_mask
 
         contours, _ = cv2.findContours(interior_masked, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         expanded_contours = []
@@ -199,14 +200,14 @@ if __name__ == '__main__':
         mr_intensity_us = np.repeat(np.repeat(mr_intensity_slice, 4, axis=0), 4, axis=1)
         mr_intensity_us = mr_intensity_us[:hne_ds_im.shape[0], :hne_ds_im.shape[1]]
 
-        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        ax.imshow(mr_intensity_us, cmap='gray')
-        for i, poly in enumerate(expanded_contours):
-            x, y = poly.exterior.xy
-            ax.plot(x, y, '-', color=colors[i % 10], linewidth=0.5)
-        ax.axis('off')
-        plt.tight_layout()
-        plt.show()
+        # fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+        # ax.imshow(mr_intensity_us, cmap='gray')
+        # for i, poly in enumerate(expanded_contours):
+        #     x, y = poly.exterior.xy
+        #     ax.plot(x, y, '-', color=colors[i % 10], linewidth=0.5)
+        # ax.axis('off')
+        # plt.tight_layout()
+        # plt.show()
 
 
         czifile = CziFile(CZI_filepath)
@@ -261,16 +262,16 @@ if __name__ == '__main__':
                 chunk_img = czifile.read_mosaic(C=0, scale_factor=1, region=(rx, ry, rx_end - rx, ry_end - ry))[0]
                 chunk_img[:, :, [0, 2]] = chunk_img[:, :, [2, 0]]  # BGR→RGB
 
-                fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-                ax.imshow(chunk_img)
-                for i, (poly, _, _) in enumerate(in_chunk):
-                    px, py = poly.exterior.xy
-                    ax.plot(np.array(px) * scale_fac + bbox.x - rx,
-                            np.array(py) * scale_fac + bbox.y - ry,
-                            '-', color=colors[i % 10], linewidth=1)
-                ax.axis('off')
-                plt.tight_layout()
-                plt.show()
+                # fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+                # ax.imshow(chunk_img)
+                # for i, (poly, _, _) in enumerate(in_chunk):
+                #     px, py = poly.exterior.xy
+                #     ax.plot(np.array(px) * scale_fac + bbox.x - rx,
+                #             np.array(py) * scale_fac + bbox.y - ry,
+                #             '-', color=colors[i % 10], linewidth=1)
+                # ax.axis('off')
+                # plt.tight_layout()
+                # plt.show()
 
                 for poly, pid, (centroid_row, centroid_col) in in_chunk:
                     px, py = poly.exterior.xy
@@ -294,8 +295,8 @@ if __name__ == '__main__':
                         continue
 
                     masked_pixels = patch_crop[mask_crop > 0]
-                    bg_fraction = (masked_pixels.mean(axis=1) > 210).mean()
-                    if bg_fraction > 0.3:
+                    bg_fraction = (masked_pixels.mean(axis=1) > 200).mean()
+                    if bg_fraction > 0.2:
                         continue
 
                     masked_patch = patch_crop.copy()
@@ -312,7 +313,6 @@ if __name__ == '__main__':
                         result[vol_name] = vol_arr[mr_col, mr_row, slice_num]
                     result.update(extract_features(masked_patch))
                     all_results.append(result)
-
 
         df = pd.DataFrame(all_results)
         czi_stem = os.path.splitext(os.path.basename(CZI_filepath))[0]
