@@ -88,8 +88,8 @@ def get_bf_slice_index(bf_cropped_dir, img_number):
     return all_files.index(match)
 
 
-def CSV_CZI_lookup(rab_ID, block, file_numb):
-    BaseCephPath = "/System/Volumes/Data/ceph/hifu/animal_data/IACUC1800/"
+def CSV_CZI_lookup(rab_ID, block, file_numb, ceph_base='/System/Volumes/Data/ceph/hifu'):
+    BaseCephPath = os.path.join(ceph_base, 'animal_data/IACUC1800/')
     block_no = block.lower()
     # Path to CSV-
     csv_dirpath = os.path.join(BaseCephPath, rab_ID, rab_ID + "_BlockFaceImages", block_no, "csv_files")

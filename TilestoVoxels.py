@@ -50,7 +50,8 @@ if __name__ == '__main__':
     Block = f'Block{block_no:02d}'
     #Need this one to draw tiles-
     #Need to call directory instead of niftis->
-    root_dir = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
+    CEPH_BASE = '/System/Volumes/Data/ceph/hifu'
+    root_dir = os.path.join(CEPH_BASE, 'users/jbonaventura/RabbitRegistrationProj/RabbitData')
     rabbase= os.path.join(root_dir, Rabbit)
     hne_base_dir = os.path.join(rabbase, 'HnE', Block)
 
@@ -109,7 +110,7 @@ if __name__ == '__main__':
         #Finding tps transform between CZI and blockface->
         img_number = re.search(r'\d+', hne_filenames[img]).group()  # e.g. '0011'
         landmarks = load_landmarks(hne_base_dir, img_number)
-        CZI_filepath = CSV_CZI_lookup(Rabbit, Block, img_number)
+        CZI_filepath = CSV_CZI_lookup(Rabbit, Block, img_number, ceph_base=CEPH_BASE)
 
         scale_fac=20 #scale factor between HnE raw and downsampled
         src = np.array([[p.y(), p.x()] for p in landmarks[0]])*3  # fixed
