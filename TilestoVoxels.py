@@ -82,7 +82,7 @@ if __name__ == '__main__':
 
     mr_intensity_arr = next(v for k, v in mr_volumes.items() if k.startswith('InVivoReg'))
 
-    hne_filenames = sorted(f for f in os.listdir(reg_HnE_dir) if f.endswith('Reg.png') and not f.startswith('._'))
+    hne_filenames = sorted(f for f in os.listdir(reg_HnE_dir) if f.lower().endswith('reg.png') and not f.startswith('._'))
     hne_bf_indices = [re.search(r'\d+', f).group()[-2:] for f in hne_filenames]
     hne_images = [np.array(Image.open(os.path.join(reg_HnE_dir, f))) for f in hne_filenames]
     reg_HnE_arr = np.stack(hne_images, axis=2)  # (H, W, N_slices, 3)
@@ -177,6 +177,8 @@ if __name__ == '__main__':
             bf_centroid_row = int(poly.centroid.y)
             bf_centroid_col = int(poly.centroid.x)
             expanded = poly.buffer(1.5, join_style=2)
+            if expanded.geom_type == 'MultiPolygon':
+                expanded = max(expanded.geoms, key=lambda g: g.area)
             expanded_contours.append(expanded)
             bf_pts = np.array(expanded.exterior.coords)  # (N, 2) [x, y] blockface
             hne_pts = splines(bf_pts[:, ::-1])  # [x,y]→[row,col]→splines→[x,y] downsampled HnE

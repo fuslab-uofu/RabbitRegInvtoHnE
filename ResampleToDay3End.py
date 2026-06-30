@@ -33,7 +33,7 @@ os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 # Paths — edit these two lines per rabbit
 # ---------------------------------------------------------------------------
 RABBIT_FOLDER = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RABBIT_ID     = 'R24-103'
+RABBIT_ID     = 'R24-240'
 
 _base     = os.path.join(RABBIT_FOLDER, RABBIT_ID, 'InVivo_MR', 'InVMRDataSets')
 DAY3_DIR  = os.path.join(_base, 'Day3')
@@ -511,7 +511,7 @@ if __name__ == '__main__':
         print(f"  Cached → {DISPLACEMENT_CACHE}")
 
     # --- Day0 volumes → Day3_end ---
-    day0_paths = sorted(glob.glob(os.path.join(DAY0_DIR, '*.nii.gz')))
+    day0_paths = sorted(glob.glob(os.path.join(DAY0_DIR, 'Masked', '*.nii.gz')))
     for path in day0_paths:
         stem = os.path.basename(path).replace('.nii.gz', '')
         out  = os.path.join(OUT_DIR, f'{stem}_regToDay3End.nii.gz')

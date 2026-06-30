@@ -4,10 +4,22 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 import cv2
 from scipy.ndimage import label, binary_fill_holes
+import os
+from pathlib import Path
 
+# --- Config ---
+CEPH_BASE  = '/System/Volumes/Data/ceph/hifu'
+Rabbit     = 'R24-082'
+Day        = 'Day0'
+template   = 'T1wCE.nii.gz'
+
+rabbase  = os.path.join(CEPH_BASE, 'users/jbonaventura/RabbitRegistrationProj/RabbitData', Rabbit)
+data_dir = Path(os.path.join(rabbase, 'InVivo_MR/InVMRDataSets', Day))
+out_dir  = data_dir / 'Masked'
+out_dir.mkdir(exist_ok=True)
 
 #Import template image-
-temp_path = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R24-103/InVivo_MR/InVMRDataSets/Day0/T1wCE.nii.gz"
+temp_path = str(data_dir / template)
 tempvol = nib.load(temp_path).get_fdata()
 print(tempvol.shape)
 
@@ -35,20 +47,15 @@ plt.show()
 
 
 # Apply mask and save for Slicer inspection
-img = nib.load(temp_path)
-masked_vol = img.get_fdata() * mask
-out = nib.Nifti1Image(masked_vol.astype(np.float32), img.affine, img.header)
-nib.save(out, '/Users/jbonaventura/Desktop/testout.nii.gz')
-print('Saved testout.nii.gz')
+# img = nib.load(temp_path)
+# masked_vol = img.get_fdata() * mask
+# out = nib.Nifti1Image(masked_vol.astype(np.float32), img.affine, img.header)
+# nib.save(out, str(out_dir / 'testout.nii.gz'))
+# print('Saved testout.nii.gz')
 
-# Apply mask to all volumes in the Day0 folder
-import os
-from pathlib import Path
+# Apply mask to all volumes in the Day folder
 
-data_dir = Path('/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R24-103/InVivo_MR/InVMRDataSets/Day0')
-out_dir = Path('/Users/jbonaventura/Desktop/TestOutputs')
-
-for nii_file in sorted(data_dir.glob('*.nii.gz')):
+for nii_file in sorted(f for f in data_dir.glob('*.nii.gz') if not f.name.startswith('._')):
     img = nib.load(str(nii_file))
     masked_vol = img.get_fdata() * mask
     out = nib.Nifti1Image(masked_vol.astype(np.float32), img.affine, img.header)
