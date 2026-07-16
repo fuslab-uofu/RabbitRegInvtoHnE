@@ -7,6 +7,14 @@ import cv2
 from scipy.ndimage import label, binary_opening, binary_closing
 
 
+def swap_channel_order(img):
+    # Zeiss CZIs store brightfield RGB natively as BGR (pixel_type="bgr24"); aicspylibczi
+    # returns those bytes as-is with no conversion, and pylibCZIrw always tags written
+    # output as bgr24 regardless of content - so this same reversal is applied once on
+    # read (BGR -> RGB) and again just before writing (RGB -> BGR) to match the fixed tag.
+    return img[..., ::-1]
+
+
 def make_tissue_mask(img_rgb, sat_threshold=30, min_component_area=500,
                      morph_open_radius=3, morph_close_radius=10):
     # Convert to HSV and pull the saturation channel — tissue is stained (high sat),

@@ -16,12 +16,12 @@ def load_files_pathlib(directory_path, name_pattern, file_type):
     return matching_files
 
 
-directory = '/System/Volumes/Data/ceph/hifu/animal_data/IACUC1800/R24-101/R24-101_BlockFaceImages/block09'
+directory = '/System/Volumes/Data/ceph/hifu/animal_data/IACUC1800/R23-058/R23-058_BlockFaceImages/block03'
 files = load_files_pathlib(directory, 'scatter', '.jpg')
 
 # Define the path
 #new_dir_path = Path(os.path.join(directory, "CroppedImages"))
-new_dir_path = Path("/Users/jbonaventura/Desktop/r24101_croppedbf")
+new_dir_path = Path("/Users/jbonaventura/Desktop/r23058_croppedbf")
 
 # Create the directory and any necessary parents, suppressing errors if it exists
 new_dir_path.mkdir(parents=True, exist_ok=True)
@@ -37,11 +37,11 @@ for file_path in files:
     img_array = np.array(img)
     #Change Crop region-
     cropped_im=img_array[775:3300,1500:3400,:]
-    plt.imshow(cropped_im)
-    plt.show()
+    # plt.imshow(cropped_im)
+    # plt.show()
 
     # # # Save the image as a TIFF file
-    # file_name = os.path.splitext(os.path.basename(file_path))[0]
-    # new_file_path=os.path.join(new_dir_path, file_name + ".tiff")
-    # CImage = Image.fromarray(cropped_im)
-    # CImage.save(new_file_path, 'TIFF')
+    file_name = os.path.splitext(os.path.basename(file_path))[0]
+    new_file_path=os.path.join(new_dir_path, file_name + ".tiff")
+    CImage = Image.fromarray(cropped_im)
+    CImage.save(new_file_path, 'TIFF')

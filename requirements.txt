@@ -18,3 +18,6 @@ czifile==2019.7.2.1
 itk==5.4.5
 PyQt5==5.15.11
 shapely==2.1.2
+pylibCZIrw==6.1.0
+pyvips==3.1.1
+torchstain==1.4.1

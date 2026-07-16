@@ -7,6 +7,7 @@
 
 
 import sys
+import re
 from pathlib import Path
 from PyQt5.QtWidgets import QDialog, QLineEdit,  QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsOpacityEffect, QScrollArea, QVBoxLayout as VBoxLayout
 
@@ -24,7 +25,7 @@ global sf1234
 sf1234=3
 
 #Can set default folder here to make finding files easier->
-DEFAULT_FOLDER = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-055"
+DEFAULT_FOLDER = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R24-101"
 
 class ImageViewer(QDialog):
     def __init__(self, image):
@@ -207,10 +208,14 @@ class ImageSelector(QMainWindow):
         self.load_button1 = QPushButton("Block Face Image")
         self.load_button1.clicked.connect(self.load_image1)
         button_layout.addWidget(self.load_button1)
-        
+
         self.load_button2 = QPushButton("Open Histology Image")
         self.load_button2.clicked.connect(self.load_image2)
         button_layout.addWidget(self.load_button2)
+
+        self.load_all_button = QPushButton("Load All from H&E")
+        self.load_all_button.clicked.connect(self.load_all_from_hne)
+        button_layout.addWidget(self.load_all_button)
         
         self.layout.addLayout(button_layout)
 
@@ -311,6 +316,68 @@ class ImageSelector(QMainWindow):
         self.points_image2 = []
         self.selected_index = None
 
+    def load_all_from_hne(self):
+        if not self.image2_path:
+            print("Load the H&E image first.")
+            return
+
+        hne_path = Path(self.image2_path)
+        # Handle both .../Block06/Registered/img.png and .../Block06/img.png
+        if hne_path.parent.name.lower() == 'registered':
+            block_dir = hne_path.parent.parent
+        else:
+            block_dir = hne_path.parent
+        rabbase    = block_dir.parent.parent  # .../R24-058
+        block_name = block_dir.name
+
+        img_number = re.search(r'\d+', hne_path.stem).group()
+
+        # --- Blockface ---
+        bf_dir = rabbase / 'BlockFace_RGB' / block_name / 'CroppedImages'
+        img_int = int(img_number)
+        bf_candidates = sorted(
+            f for f in bf_dir.iterdir()
+            if f.name.endswith('_scatter.tiff') and not f.name.startswith('._')
+            and any(int(n) == img_int for n in re.findall(r'\d+', f.name))
+        ) if bf_dir.exists() else []
+
+        if bf_candidates:
+            self.image1_path = str(bf_candidates[0])
+            pixmap_1 = QPixmap(self.image1_path)
+            half_width  = pixmap_1.width()  // sf1234
+            half_height = pixmap_1.height() // sf1234
+            pixmap_1 = pixmap_1.scaled(half_width, half_height)
+            self.label1.setPixmap(pixmap_1)
+            self.label1.setAlignment(Qt.AlignCenter)
+            self.title1.setText(bf_candidates[0].name)
+            self.label1.setFixedSize(pixmap_1.size())
+            self.points_image1 = []
+            print(f"Loaded blockface: {bf_candidates[0].name}")
+        else:
+            print(f"No blockface image found for {img_number} in {bf_dir}")
+
+        # --- Landmarks ---
+        landmarks_dir = block_dir / 'Landmarks'
+        if landmarks_dir.exists():
+            img_int = int(img_number)
+            lm_candidates = sorted(
+                f for f in landmarks_dir.iterdir()
+                if f.name.endswith('.npy') and not f.name.startswith('._')
+                and any(int(n) == img_int for n in re.findall(r'\d+', f.name))
+            )
+            if lm_candidates:
+                _landmarks = np.load(str(lm_candidates[0]), allow_pickle=True)
+                self.points_image1 = list(_landmarks[0])
+                self.points_image2 = list(_landmarks[1])
+                self.selected_index = None
+                self.drawMarks(self.label1, QColor(255, 0, 0), self.points_image1)
+                self.drawMarks(self.label2, QColor(0, 255, 0), self.points_image2)
+                print(f"Loaded landmarks: {lm_candidates[0].name}")
+            else:
+                print(f"No landmarks found for {img_number} in {landmarks_dir}")
+        else:
+            print("No Landmarks folder found")
+
     def load_landmarks(self):
         options = QFileDialog.Options()
         _landmarks_file, _ = QFileDialog.getOpenFileName(self, "Load Landmarks *.npy", DEFAULT_FOLDER, "Landmarks (*.npy);;All Files (*)", options=options)
@@ -407,7 +474,8 @@ class ImageSelector(QMainWindow):
 
             img2 = cv2.imread(self.image2_path)
 
-            splines= ski.transform.ThinPlateSplineTransform.from_estimate(pts_img1,pts_img2)
+            splines = ski.transform.ThinPlateSplineTransform()
+            splines.estimate(pts_img1, pts_img2)
 
             self.output_image=ski.transform.warp(img2,splines, output_shape=(_height, _width, _channel))
             #normalize and convert to uint8

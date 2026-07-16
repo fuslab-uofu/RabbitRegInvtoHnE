@@ -158,7 +158,7 @@ class TillingGUI(QMainWindow):
         try:
             match_folder = next(
                 d for d in os.listdir(self.hne_base_dir)
-                if d.lower() == "reg" and os.path.isdir(os.path.join(self.hne_base_dir, d))
+                if d.lower() == "registered" and os.path.isdir(os.path.join(self.hne_base_dir, d))
             )
             reg_HnE_dir = os.path.join(self.hne_base_dir, match_folder)
         except StopIteration:
@@ -543,8 +543,8 @@ class TillingGUI(QMainWindow):
         self.canvas.draw()
 
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R24-082"
-Block = 5
+RabbitID="R24-101"
+Block = 11
 
 if __name__ == '__main__':
     blockId = "Block" + f"{Block:02d}"

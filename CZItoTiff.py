@@ -8,9 +8,11 @@ import pandas as pd
 import math
 import ast
 
+from TileUtils import swap_channel_order
+
 #Now to add pointing so we can go from rabbit number and block to all of this-
-rab_ID='R24-101'
-block_no='block12'
+rab_ID='R23-055'
+block_no='block07'
 
 # #Path to Savepoint-
 BaseSavePath="//System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData"
@@ -39,35 +41,42 @@ for i in range(csv_array.shape[0]):
 match_array = np.array(match_vals)
 
 #Path to CZI directory-
-czi_dirpath=os.path.join(BaseCephPath, rab_ID, rab_ID + "_HnE_5X", block_no)
+czi_dirpath=os.path.join(BaseCephPath, rab_ID, rab_ID + "_HnE_5x", block_no)
 for file in os.listdir(czi_dirpath):
     print(file)
     #Can edit for funky naming stuff that may go on-
     if "_" in file:
         full_path = os.path.join(czi_dirpath, file)
         file_name = os.path.splitext(os.path.basename(full_path))[0]
-        HnE_Label = file_name.split("_")[-2]
-        print(HnE_Label)
-        idx = np.where(match_array==HnE_Label)[0]
+
+        first_try = file_name.split("_")[-2]
+        idx = np.where(match_array == first_try)[0]
         try:
-            image_tag = str(match_array[idx,1][0])
-        except:
-            HnE_Label = file_name.split("_")[-1]
-            print(HnE_Label)
-            idx = np.where(match_array == HnE_Label)[0]
             image_tag = str(match_array[idx, 1][0])
-        print(image_tag)
+            HnE_Label = first_try
+        except IndexError:
+            second_try = file_name.split("_")[-1]
+            idx = np.where(match_array == second_try)[0]
+            try:
+                image_tag = str(match_array[idx, 1][0])
+                HnE_Label = second_try
+            except IndexError:
+                print(f"No CSV match found for '{file}' (tried '{first_try}' and '{second_try}'). "
+                      f"Assuming clerical error, skipping.")
+                continue
+        print(f"Matched '{file}' -> label '{HnE_Label}', image_tag '{image_tag}'")
 
         czifile = CziFile(full_path)
 
         bbox = czifile.get_mosaic_bounding_box()
         czi_img = czifile.read_mosaic(C=0, scale_factor=1/20, region=(bbox.x, bbox.y, bbox.w, bbox.h), background_color=(1,1,1))[0,:,:,:]
-        # plt.imshow(czi_img)
-        # plt.show()
+        czi_img = swap_channel_order(czi_img)
+        plt.imshow(czi_img)
+        plt.show()
 
         #Save Image as Tiff-
-        new_file_path = os.path.join(save_dirpath, "HnE_IMG_"+ image_tag + ".tif")
-        CImage = Image.fromarray(czi_img)
-        CImage.save(new_file_path, 'TIFF')
+        # new_file_path = os.path.join(save_dirpath, "HnE_IMG_"+ image_tag + ".tif")
+        # CImage = Image.fromarray(czi_img)
+        # CImage.save(new_file_path, 'TIFF')
 
 

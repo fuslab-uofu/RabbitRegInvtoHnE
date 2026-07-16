@@ -33,7 +33,7 @@ os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 # Paths — edit these two lines per rabbit
 # ---------------------------------------------------------------------------
 RABBIT_FOLDER = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RABBIT_ID     = 'R24-240'
+RABBIT_ID     = 'R24-082'
 
 _base     = os.path.join(RABBIT_FOLDER, RABBIT_ID, 'InVivo_MR', 'InVMRDataSets')
 DAY3_DIR  = os.path.join(_base, 'Day3')
