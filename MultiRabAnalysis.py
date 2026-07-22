@@ -51,7 +51,8 @@ def get_mr_style(variable_name):
 
 def load_slide(cellcount_path, data_dir):
     basename = os.path.basename(cellcount_path).replace("-cellcount.csv", "")
-    texture_matches = glob.glob(os.path.join(data_dir, f"voxel_features_{basename}*.csv"))
+    texture_basename = basename.removesuffix("_corrected_fullres")
+    texture_matches = glob.glob(os.path.join(data_dir, f"voxel_features_{texture_basename}*.csv"))
     if not texture_matches:
         print(f"No texture file found for {basename}, skipping.")
         return None
@@ -81,11 +82,30 @@ def natural_sort_key(s):
     return [int(chunk) if chunk.isdigit() else chunk.lower() for chunk in re.split(r'(\d+)', s)]
 
 
+def select_cellcount_files(cellcount_files):
+    """Only the full-res batch-pipeline's `_corrected_fullres` cellcount files --
+    slides that haven't been re-run with full-res cell detection yet are
+    excluded entirely, not filled in with the original lower-res counts."""
+    fullres_files = [f for f in cellcount_files if f.endswith("_corrected_fullres-cellcount.csv")]
+    fullres_slides = {os.path.basename(f).replace("-cellcount.csv", "").removesuffix("_corrected_fullres")
+                       for f in fullres_files}
+    all_slides = {os.path.basename(f).replace("-cellcount.csv", "").removesuffix("_corrected_fullres")
+                  for f in cellcount_files}
+    n_skipped = len(all_slides - fullres_slides)
+    print(f"  {len(fullres_files)} slide(s) with full-res cell counts "
+          f"({n_skipped} slide(s) skipped, no full-res version yet)")
+    return fullres_files
+
+
 def load_rabbit(rabbit_id, block_num):
     data_dir = os.path.join(BASE_DIR, f"R{rabbit_id}", "Analysis", f"Block{block_num:02d}")
-    cellcount_files = sorted(glob.glob(os.path.join(data_dir, "HnE*cellcount.csv")), key=natural_sort_key)
+    cellcount_files = glob.glob(os.path.join(data_dir, "HnE*cellcount.csv"))
     if not cellcount_files:
         print(f"No cellcount files found for rabbit {rabbit_id} in {data_dir}")
+        return None
+    cellcount_files = sorted(select_cellcount_files(cellcount_files), key=natural_sort_key)
+    if not cellcount_files:
+        print(f"No full-res cellcount files found for rabbit {rabbit_id} in {data_dir}")
         return None
     slides = []
     reference_hne_names = None
@@ -843,7 +863,7 @@ MR_DISTRIBUTION_FEATURES = None
 RUN_PCA_BATCH_CHECK           = False
 RUN_HNE_FEATURE_DISTRIBUTIONS = False
 RUN_MR_FEATURE_DISTRIBUTIONS  = True
-RUN_SPATIAL_MAP               = False
+RUN_SPATIAL_MAP               = True
 RUN_CROSS_CORR                = False
 RUN_RF_RABBIT_HOLDOUT         = True
 RUN_RF_SLIDE_HOLDOUT          = True

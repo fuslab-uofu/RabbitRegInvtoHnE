@@ -12,8 +12,8 @@ import glob
 
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R24-101"
-Block = 11
+RabbitID="R24-082"
+Block = 5
 
 #If we're working from a directory->
 RegDir = os.path.join(RabbitFolder, RabbitID, 'InVivo_MR', 'InVMRDataSets', 'Day3End_Registered')
@@ -82,7 +82,7 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpola
 
     return current_volume, current_affine
 
-def MultiStepRegDir(input_dir, RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpolation='nearest'):
+def MultiStepRegDir(input_dir, RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpolation='nearest', out_dir_name=None):
     """
     Run MultiStepReg on every .nii.gz in input_dir, using each file as the moving volume.
 
@@ -90,30 +90,41 @@ def MultiStepRegDir(input_dir, RabbitID, Block, RabbitFolder, MovingStart, EndFi
     Output filenames: {first_two_parts_of_stem}_{regTo_suffix}_RegTo{end_label}.nii.gz
     e.g. t2map_im_MID78_interleave_MID85_regToDay3End.nii.gz
       →  t2map_im_regToDay3End_RegToBlock07.nii.gz
+
+    If input_dir contains a Normalized/ subfolder (see ResampleToDay3End.py's
+    SAVE_NORMALIZED option), those volumes get registered too via the same
+    recursive call, landing in {RegDataOut}/Normalized_{input_dir_name}_RegTo{end_label}/
+    (same name as the unnormalized output, just prefixed with "Normalized_").
     """
     end_label   = EndFixed.replace("ExVivoBlock", f"ExVivoBlock{Block:02d}").replace("BlockFace", f"Block{Block:02d}")
     save_paths  = find_all_the_paths(RabbitID, Block, RabbitFolder, MovingStart)
-    out_dir     = os.path.join(save_paths['RegDataOut'], f"{os.path.basename(input_dir)}_RegTo{end_label}")
+    dir_name    = out_dir_name or os.path.basename(input_dir)
+    out_dir     = os.path.join(save_paths['RegDataOut'], f"{dir_name}_RegTo{end_label}")
     os.makedirs(out_dir, exist_ok=True)
 
     vol_paths = sorted(glob.glob(os.path.join(input_dir, '*.nii.gz')))
     if not vol_paths:
         print(f"No .nii.gz files found in {input_dir}")
-        return
+    else:
+        for vol_path in vol_paths:
+            stem        = os.path.basename(vol_path).replace('.nii.gz', '')
+            short_stem  = '_'.join(stem.split('_')[:2])
+            regt_match  = re.search(r'_[Rr]eg[Tt]o\w+', stem)
+            regt_part   = regt_match.group(0) if regt_match else ''
+            out_name    = f"{short_stem}{regt_part}_RegTo{end_label}.nii.gz"
+            out_path    = os.path.join(out_dir, out_name)
 
-    for vol_path in vol_paths:
-        stem        = os.path.basename(vol_path).replace('.nii.gz', '')
-        short_stem  = '_'.join(stem.split('_')[:2])
-        regt_match  = re.search(r'_[Rr]eg[Tt]o\w+', stem)
-        regt_part   = regt_match.group(0) if regt_match else ''
-        out_name    = f"{short_stem}{regt_part}_RegTo{end_label}.nii.gz"
-        out_path    = os.path.join(out_dir, out_name)
+            print(f"Processing {os.path.basename(vol_path)} → {out_name}")
+            result, affine = MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed,
+                                          interpolation=interpolation, moving_path=vol_path, save=False)
+            nib.save(nib.Nifti1Image(result, affine), out_path)
+            print(f"  Saved → {out_path}")
 
-        print(f"Processing {os.path.basename(vol_path)} → {out_name}")
-        result, affine = MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed,
-                                      interpolation=interpolation, moving_path=vol_path, save=False)
-        nib.save(nib.Nifti1Image(result, affine), out_path)
-        print(f"  Saved → {out_path}")
+    normalized_dir = os.path.join(input_dir, 'Normalized')
+    if os.path.isdir(normalized_dir):
+        print(f"Found Normalized/ subfolder in {input_dir} — registering those too...")
+        MultiStepRegDir(normalized_dir, RabbitID, Block, RabbitFolder, MovingStart, EndFixed,
+                         interpolation=interpolation, out_dir_name=f"Normalized_{dir_name}")
 
 def MultiStartRegToFixed(RabbitID, Block, RabbitFolder, EndFixed, interpolation='linear'):
     """
@@ -144,13 +155,13 @@ def MultiStartRegToFixed(RabbitID, Block, RabbitFolder, EndFixed, interpolation=
         print(f"  Saved → {out_path}")
 
 if __name__ == '__main__':
-   MultiStartRegToFixed(RabbitID, Block, RabbitFolder, "BlockFace")
+   # MultiStartRegToFixed(RabbitID, Block, RabbitFolder, "BlockFace")
 
     # Single file run through-
     #MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='nearest')
 
     # Run through all the files in a directory-
-    #MultiStepRegDir(RegDir, RabbitID, Block, RabbitFolder,"InVivo", "BlockFace",interpolation='nearest')
+    MultiStepRegDir(RegDir, RabbitID, Block, RabbitFolder,"InVivo", "BlockFace",interpolation='nearest')
 
 #Buggy- needs work before implementation
 # resampled=compose_e_resample(SlicerTPath, dfieldpath, fixed_image, moving_image)

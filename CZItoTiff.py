@@ -11,12 +11,15 @@ import ast
 from TileUtils import swap_channel_order
 
 #Now to add pointing so we can go from rabbit number and block to all of this-
-rab_ID='R23-055'
+rab_ID='R23-295'
 block_no='block07'
 
 # #Path to Savepoint-
 BaseSavePath="//System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData"
-save_dirpath=os.path.join(BaseSavePath, rab_ID, "HnE", block_no)
+# Destination folder always capitalized "Block##", independent of block_no's casing (source paths below keep using block_no as-is)
+block_num_str = re.findall(r'\d+', block_no)[0]
+dest_block_no = f"Block{block_num_str}"
+save_dirpath=os.path.join(BaseSavePath, rab_ID, "HnE", dest_block_no)
 if not os.path.exists(save_dirpath):
     os.makedirs(save_dirpath)
 
@@ -71,12 +74,12 @@ for file in os.listdir(czi_dirpath):
         bbox = czifile.get_mosaic_bounding_box()
         czi_img = czifile.read_mosaic(C=0, scale_factor=1/20, region=(bbox.x, bbox.y, bbox.w, bbox.h), background_color=(1,1,1))[0,:,:,:]
         czi_img = swap_channel_order(czi_img)
-        plt.imshow(czi_img)
-        plt.show()
+        # plt.imshow(czi_img)
+        # plt.show()
 
         #Save Image as Tiff-
-        # new_file_path = os.path.join(save_dirpath, "HnE_IMG_"+ image_tag + ".tif")
-        # CImage = Image.fromarray(czi_img)
-        # CImage.save(new_file_path, 'TIFF')
+        new_file_path = os.path.join(save_dirpath, "HnE_IMG_"+ image_tag + ".tif")
+        CImage = Image.fromarray(czi_img)
+        CImage.save(new_file_path, 'TIFF')
 
 

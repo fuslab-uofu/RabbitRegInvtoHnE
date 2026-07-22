@@ -56,6 +56,18 @@ def find_all_the_paths(RabbitID, Block, pathtoRabbits, Moving):
         "RegDataProc":     os.path.join(moving_reg_folder, 'RegDataProc'),
     }
 
+def find_hne_slide_path(RabbitID, Block, pathtoRabbits, czi_path, normalized=True):
+    """Resolve the H&E slide to actually read: the normalized TIFF written by
+    TilingCorrection.py (default), or the original raw CZI (normalized=False)."""
+    if not normalized:
+        return czi_path
+    BlockID = "Block" + f"{Block:02d}"
+    RabbitFolder = os.path.join(pathtoRabbits, RabbitID)
+    czi_stem = os.path.splitext(os.path.basename(czi_path))[0]
+    return os.path.join(RabbitFolder, 'HnE', BlockID, 'NormalizedFull',
+                         czi_stem + '_corrected_fullres.tif')
+
+
 def find_day0_paths(RabbitID, pathtoRabbits):
     day0_dir = os.path.join(pathtoRabbits, RabbitID, 'InVivo_MR', 'InVMRDataSets', 'Day0')
     return {

@@ -33,7 +33,7 @@ os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 # Paths — edit these two lines per rabbit
 # ---------------------------------------------------------------------------
 RABBIT_FOLDER = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RABBIT_ID     = 'R24-082'
+RABBIT_ID     = 'R24-240'
 
 _base     = os.path.join(RABBIT_FOLDER, RABBIT_ID, 'InVivo_MR', 'InVMRDataSets')
 DAY3_DIR  = os.path.join(_base, 'Day3')
@@ -88,6 +88,17 @@ RETUNE_MASK     = True
 MASK_THRESH     = 10
 MASK_MASKTHRESH = 150
 MASK_KERNSIZE   = 15
+
+# ---------------------------------------------------------------------------
+# Normalization config
+# ---------------------------------------------------------------------------
+# Set SAVE_NORMALIZED=True to additionally save an intensity-normalized copy of
+# each registered volume into a Normalized/ subfolder of OUT_DIR - the raw save
+# next to it is untouched either way.
+SAVE_NORMALIZED = True
+NORM_METHOD     = 'percentile'  # 'percentile' | 'minmax' | 'zscore'
+NORM_CLIP_PCT   = 1.0
+NORM_OUT_RANGE  = (0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -382,11 +393,48 @@ def resample_with_field(vol_arr, voxel_field, order=1):
 
 
 # ---------------------------------------------------------------------------
+# Normalization (adapted from mri_embed.py's _load_norm, minus the npy-file load)
+# ---------------------------------------------------------------------------
+
+def normalize_mr_array(arr, norm='percentile', clip_pct=1.0, out_range=(0.0, 1.0)):
+    """Intensity-normalize an already-loaded MR array: percentile clip, minmax, or zscore."""
+    a = np.nan_to_num(arr.astype(np.float32))
+    lo_out, hi_out = out_range
+    nz = a[a != 0]
+    if norm in ('percentile', 'clip_minmax'):
+        if nz.size:
+            lo, hi = np.percentile(nz, [clip_pct, 100 - clip_pct])
+            a = np.clip((a - lo) / (hi - lo + 1e-9), 0, 1) * (hi_out - lo_out) + lo_out
+    elif norm == 'minmax':
+        if nz.size:
+            lo, hi = float(nz.min()), float(nz.max())
+            a = np.clip((a - lo) / (hi - lo + 1e-9), 0, 1) * (hi_out - lo_out) + lo_out
+    elif norm == 'zscore':
+        a = (a - a.mean()) / (a.std() + 1e-9)
+    return a
+
+
+def save_registered(arr, stem, day3_end_nib, out_dir, norm_out_dir=None):
+    """Save the raw registered array, plus an optional normalized copy in norm_out_dir."""
+    out = os.path.join(out_dir, f'{stem}_regToDay3End.nii.gz')
+    nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
+    print(f"  Saved → {out}")
+    if norm_out_dir:
+        norm_arr = normalize_mr_array(arr, NORM_METHOD, NORM_CLIP_PCT, NORM_OUT_RANGE)
+        norm_out = os.path.join(norm_out_dir, f'{stem}_regToDay3End.nii.gz')
+        nib.save(nib.Nifti1Image(norm_arr.astype(np.float32), day3_end_nib.affine), norm_out)
+        print(f"  Saved normalized → {norm_out}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     os.makedirs(OUT_DIR, exist_ok=True)
+    NORM_OUT_DIR = os.path.join(OUT_DIR, 'Normalized')
+    if SAVE_NORMALIZED:
+        os.makedirs(NORM_OUT_DIR, exist_ok=True)
 
     _day3 = _load_day3_log(DAY3_DIR, RABBIT_ID)
     DAY3_END_PATH     = _day3['End'][0]
@@ -451,7 +499,17 @@ if __name__ == '__main__':
         else:
             mask = build_body_mask(day3_end_arr, MASK_THRESH, MASK_MASKTHRESH, MASK_KERNSIZE)
         print(f'  Body mask built: {mask.sum():,} voxels retained')
-        del day3_end_arr
+    else:
+        day3_end_arr = day3_end_nib.get_fdata(dtype=np.float32)
+
+    # --- Day3_end structural itself → Day3End_Registered (already on the Day3_end
+    # grid, no resampling needed, but still needs masking/saving/normalizing like
+    # every other volume so it's available for cross-contrast comparison) ---
+    day3_end_stem = os.path.basename(DAY3_END_PATH).replace('.nii.gz', '')
+    end_arr = day3_end_arr * mask if APPLY_MASK else day3_end_arr
+    save_registered(end_arr, day3_end_stem, day3_end_nib, OUT_DIR,
+                     norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
+    del day3_end_arr, end_arr
 
     # --- Day3_start extras → Day3_end (Slicer only) ---
     for path in DAY3_START_EXTRA:
@@ -463,7 +521,6 @@ if __name__ == '__main__':
         print(nib.load(path).header.get_data_dtype())
         h = nib.load(path).header
         print(h.get_slope_inter())  # (scl_slope, scl_inter)
-        out  = os.path.join(OUT_DIR, f'{stem}_regToDay3End.nii.gz')
         print(f"Resampling {stem} → Day3_end ...")
         _interp = {0: sitk.sitkNearestNeighbor, 1: sitk.sitkLinear}[INTERP_ORDER]
         arr = ApplySlicerTransform(path, DAY3_END_PATH, SLICER_INV_CACHE, interpolator=_interp)
@@ -474,8 +531,8 @@ if __name__ == '__main__':
 
         if APPLY_MASK:
             arr = arr * mask
-        nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
-        print(f"  Saved → {out}")
+        save_registered(arr, stem, day3_end_nib, OUT_DIR,
+                         norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
 
     # --- End_native volumes → Day3_end grid (identity resample only) ---
     day3_end_sitk = sitk.ReadImage(DAY3_END_PATH)
@@ -485,13 +542,12 @@ if __name__ == '__main__':
             print(f"Skipping (not found): {path}")
             continue
         stem = os.path.basename(path).replace('.nii.gz', '')
-        out  = os.path.join(OUT_DIR, f'{stem}_regToDay3End.nii.gz')
         print(f"Resampling {stem} → Day3_end grid (no transform) ...")
         arr = resample_to_grid(path, day3_end_sitk, interpolator=_interp)
         if APPLY_MASK:
             arr = arr * mask
-        nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
-        print(f"  Saved → {out}")
+        save_registered(arr, stem, day3_end_nib, OUT_DIR,
+                         norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
 
     # --- Build / load Day3_end → Day0 displacement field ---
     if os.path.exists(DISPLACEMENT_CACHE):
@@ -514,14 +570,13 @@ if __name__ == '__main__':
     day0_paths = sorted(glob.glob(os.path.join(DAY0_DIR, 'Masked', '*.nii.gz')))
     for path in day0_paths:
         stem = os.path.basename(path).replace('.nii.gz', '')
-        out  = os.path.join(OUT_DIR, f'{stem}_regToDay3End.nii.gz')
         print(f"Resampling Day0/{stem} → Day3_end ...")
         vol_arr = nib.load(path).get_fdata(dtype=np.float32)
         arr     = resample_with_field(vol_arr, voxel_field, order=INTERP_ORDER)
         if APPLY_MASK:
             arr = arr * mask
-        nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
-        print(f"  Saved → {out}")
+        save_registered(arr, stem, day3_end_nib, OUT_DIR,
+                         norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
 
     print("All done.")
 
