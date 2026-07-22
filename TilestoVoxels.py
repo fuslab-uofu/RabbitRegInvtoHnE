@@ -4,6 +4,9 @@ from PyQt5.QtWidgets import QApplication
 from Viewer import VolumeViewer
 import sys
 import os
+os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")  # Homebrew's arm64 lib dir isn't on
+                                                                    # macOS's default dlopen search path;
+                                                                    # pyvips needs it to find libvips.42.dylib
 import re
 import nibabel as nib
 import numpy as np
@@ -12,6 +15,7 @@ import matplotlib.patches as patches
 from scipy.ndimage import affine_transform
 import pandas as pd
 from aicspylibczi import CziFile
+import pyvips
 import skimage as ski
 from skimage.measure import find_contours
 from skimage.morphology import dilation, square
@@ -24,6 +28,7 @@ from skimage.measure import block_reduce
 import torch
 from PIL import Image
 from TileUtils import make_tissue_mask, load_landmarks, get_bf_slice_index, CSV_CZI_lookup
+from RabbitPathFinder import find_hne_slide_path
 from shapely.geometry import Polygon
 from HnEFeatureExtraction import extract_features
 
@@ -45,8 +50,8 @@ def rectilinearize(pts, edge_map):
     return np.array(result)
 
 if __name__ == '__main__':
-    Rabbit = 'R24-103'
-    block_no = 6
+    Rabbit = 'R23-055'
+    block_no = 7
     Block = f'Block{block_no:02d}'
     #Need this one to draw tiles-
     #Need to call directory instead of niftis->
@@ -69,9 +74,13 @@ if __name__ == '__main__':
     if reg_InV.affine[0, 0] > 0 and reg_InV.affine[1, 1] > 0:
         reg_InV_arr = reg_InV_arr[::-1, ::-1, :]
 
+    USE_NORMALIZED_MRI = True  # True: read intensity-normalized MR volumes
+                                # (Normalized_Day3End_Registered_RegTo{Block}); False: read the raw registered volumes
+
     mr_volumes = {}
 
-    mr_volumes_dir = os.path.join(rabbase, 'InVivo_MR/RegDataOut/Day3End_Registered_RegTo'+Block)
+    mri_subdir = ('Normalized_Day3End_Registered_RegTo' if USE_NORMALIZED_MRI else 'Day3End_Registered_RegTo') + Block
+    mr_volumes_dir = os.path.join(rabbase, 'InVivo_MR/RegDataOut', mri_subdir)
     for _f in sorted(glob.glob(os.path.join(mr_volumes_dir, '*.nii.gz'))):
         _col_name = '_'.join(os.path.basename(_f).replace('.nii.gz', '').split('_')[:2])
         _nib = nib.load(_f)
@@ -93,6 +102,8 @@ if __name__ == '__main__':
 
     Save_Voxel_Geoms = True
     Show_Plots = True
+    USE_NORMALIZED_HNE = True  # True: read the Macenko-normalized/flat-field-corrected BigTIFF
+                                # (TilingCorrection.py output); False: read the raw CZI directly
 
     tilesize=50
     chunk_size_ds = 200   # non-overlapping chunk size in downsampled HnE pixels
@@ -213,14 +224,33 @@ if __name__ == '__main__':
         # plt.show()
 
 
-        czifile = CziFile(CZI_filepath)
-        bbox = czifile.get_mosaic_bounding_box()
+        hne_slide_path = find_hne_slide_path(Rabbit, block_no, root_dir, CZI_filepath, normalized=USE_NORMALIZED_HNE)
 
-        print("BBOXES- ",bbox.x, bbox.y)
+        if USE_NORMALIZED_HNE:
+            hne_page0 = pyvips.Image.tiffload(hne_slide_path, page=0)
+            origin_x, origin_y, full_w, full_h = 0, 0, hne_page0.width, hne_page0.height
 
-        # If we want to look at a downsampled CZI file- useful for verifying splines transform is acting how we want-
-        hne_full_ds = czifile.read_mosaic(C=0, scale_factor=1 / 20, region=(bbox.x, bbox.y, bbox.w, bbox.h))[0]
-        hne_full_ds[:, :, [0, 2]] = hne_full_ds[:, :, [2, 0]]  # BGR→RGB
+            def read_region(rx, ry, w, h):
+                return hne_page0.crop(rx, ry, w, h).numpy()
+
+            # No exact 1/20 pyramid level exists (levels are 1/2, 1/4, 1/8, 1/16, 1/32...);
+            # start from page 4 (1/16, next finer than target) and downsample the rest of the
+            # way, so this preview lands on the same scale the landmarks were picked against.
+            preview_1_16 = pyvips.Image.tiffload(hne_slide_path, page=4).numpy()
+            hne_full_ds = cv2.resize(preview_1_16, None, fx=16 / 20, fy=16 / 20, interpolation=cv2.INTER_AREA)
+        else:
+            czifile = CziFile(hne_slide_path)
+            bbox = czifile.get_mosaic_bounding_box()
+            origin_x, origin_y, full_w, full_h = bbox.x, bbox.y, bbox.w, bbox.h
+
+            def read_region(rx, ry, w, h):
+                img = czifile.read_mosaic(C=0, scale_factor=1, region=(rx, ry, w, h))[0]
+                return img[:, :, ::-1]  # BGR→RGB
+
+            hne_full_ds = czifile.read_mosaic(C=0, scale_factor=1 / 20, region=(bbox.x, bbox.y, bbox.w, bbox.h))[0]
+            hne_full_ds = hne_full_ds[:, :, ::-1]  # BGR→RGB
+
+        print("Origin- ", origin_x, origin_y)
 
         # fig, ax = plt.subplots(1, 1, figsize=(10, 10))
         # ax.imshow(hne_full_ds)
@@ -258,19 +288,18 @@ if __name__ == '__main__':
 
                 print(len(in_chunk), "Voxels in chunk")
 
-                rx  = max(bbox.x, int(cx0 * scale_fac) + bbox.x - chunk_buffer_full)
-                ry  = max(bbox.y, int(cy0 * scale_fac) + bbox.y - chunk_buffer_full)
-                rx_end = min(bbox.x + bbox.w, int(cx1 * scale_fac) + bbox.x + chunk_buffer_full)
-                ry_end = min(bbox.y + bbox.h, int(cy1 * scale_fac) + bbox.y + chunk_buffer_full)
-                chunk_img = czifile.read_mosaic(C=0, scale_factor=1, region=(rx, ry, rx_end - rx, ry_end - ry))[0]
-                chunk_img[:, :, [0, 2]] = chunk_img[:, :, [2, 0]]  # BGR→RGB
+                rx  = max(origin_x, int(cx0 * scale_fac) + origin_x - chunk_buffer_full)
+                ry  = max(origin_y, int(cy0 * scale_fac) + origin_y - chunk_buffer_full)
+                rx_end = min(origin_x + full_w, int(cx1 * scale_fac) + origin_x + chunk_buffer_full)
+                ry_end = min(origin_y + full_h, int(cy1 * scale_fac) + origin_y + chunk_buffer_full)
+                chunk_img = read_region(rx, ry, rx_end - rx, ry_end - ry)
 
                 # fig, ax = plt.subplots(1, 1, figsize=(8, 8))
                 # ax.imshow(chunk_img)
                 # for i, (poly, _, _) in enumerate(in_chunk):
                 #     px, py = poly.exterior.xy
-                #     ax.plot(np.array(px) * scale_fac + bbox.x - rx,
-                #             np.array(py) * scale_fac + bbox.y - ry,
+                #     ax.plot(np.array(px) * scale_fac + origin_x - rx,
+                #             np.array(py) * scale_fac + origin_y - ry,
                 #             '-', color=colors[i % 10], linewidth=1)
                 # ax.axis('off')
                 # plt.tight_layout()
@@ -278,8 +307,8 @@ if __name__ == '__main__':
 
                 for poly, pid, (centroid_row, centroid_col) in in_chunk:
                     px, py = poly.exterior.xy
-                    px_patch = np.array(px) * scale_fac + bbox.x - rx
-                    py_patch = np.array(py) * scale_fac + bbox.y - ry
+                    px_patch = np.array(px) * scale_fac + origin_x - rx
+                    py_patch = np.array(py) * scale_fac + origin_y - ry
 
                     x0 = max(0, int(min(px_patch)) - 1)
                     y0 = max(0, int(min(py_patch)) - 1)
@@ -299,7 +328,7 @@ if __name__ == '__main__':
 
                     masked_pixels = patch_crop[mask_crop > 0]
                     bg_fraction = (masked_pixels.mean(axis=1) > 200).mean()
-                    if bg_fraction > 0.2:
+                    if bg_fraction > 0.5:
                         continue
 
                     masked_patch = patch_crop.copy()
@@ -319,14 +348,18 @@ if __name__ == '__main__':
 
         df = pd.DataFrame(all_results)
         czi_stem = os.path.splitext(os.path.basename(CZI_filepath))[0]
-        csv_path = os.path.join(features_dir, f'voxel_features_{czi_stem}.csv')
+        # Tag outputs when reading the normalized TIFF/MRI so a test run never overwrites
+        # the existing raw-based outputs - lets them be compared side by side.
+        hne_tag = '_normalized' if USE_NORMALIZED_HNE else ''
+        mri_tag = '_normMRI' if USE_NORMALIZED_MRI else ''
+        csv_path = os.path.join(features_dir, f'voxel_features_{czi_stem}{hne_tag}{mri_tag}.csv')
         df.to_csv(csv_path, index=False)
         print(f"Saved {len(df)} rows to {csv_path}")
 
         if Save_Voxel_Geoms:
             surviving_ids = set(df['poly_id'])
             geojson_features = []
-            for pid, poly in zip(poly_ids, hne_polys):
+            for pid, poly, (centroid_row, centroid_col) in zip(poly_ids, hne_polys, bf_centroids):
                 if pid not in surviving_ids:
                     continue
                 coords = np.array(poly.exterior.coords)
@@ -336,9 +369,16 @@ if __name__ == '__main__':
                 geojson_features.append({
                     "type": "Feature",
                     "geometry": {"type": "Polygon", "coordinates": [ring]},
-                    "properties": {"object_type": "annotation", "name": f"tile_{pid}", "poly_id": int(pid)}
+                    "properties": {
+                        "object_type": "annotation",
+                        "name": f"tile_{pid}",
+                        "poly_id": int(pid),
+                        "centroid_row": int(centroid_row),
+                        "centroid_col": int(centroid_col),
+                        "slice_num": int(slice_num),
+                    }
                 })
-            geojson_path = os.path.join(features_dir, f'voxel_polygons_{czi_stem}.geojson')
+            geojson_path = os.path.join(features_dir, f'voxel_polygons_{czi_stem}{hne_tag}{mri_tag}.geojson')
             with open(geojson_path, 'w') as f:
                 json.dump({"type": "FeatureCollection", "features": geojson_features}, f)
             print(f"Saved {len(geojson_features)} polygons to {geojson_path}")
