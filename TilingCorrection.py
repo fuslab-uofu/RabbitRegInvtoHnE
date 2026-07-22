@@ -1,9 +1,10 @@
 #Import Desired Libraries
 import os
 import re
-os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")  # Homebrew's arm64 lib dir isn't on
-                                                                    # macOS's default dlopen search path;
-                                                                    # pyvips needs it to find libvips.42.dylib
+import ctypes
+os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")  # macOS Homebrew arm64 lib dir
+ctypes.CDLL("/working/ProgCaches/CondaCaches/conda-envs/libvips-env/lib/libvips.so.42", mode=ctypes.RTLD_GLOBAL)
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -15,7 +16,7 @@ from pylibCZIrw import czi as cziwriter
 
 from TileUtils import make_tissue_mask, swap_channel_order, CSV_CZI_lookup
 
-CEPH_BASE = "/System/Volumes/Data/ceph/hifu"
+CEPH_BASE = "/ceph/hifu"
 
 Ref_path = os.path.join(CEPH_BASE, "users/jbonaventura/RabbitRegistrationProj/RefMaterials/HnE_R23-055_H7_7a_StainNormRef.tif")
 
@@ -25,9 +26,10 @@ Ref_path = os.path.join(CEPH_BASE, "users/jbonaventura/RabbitRegistrationProj/Re
 # same convention TilesToVoxels.py already uses), so un-registered edge slices are
 # skipped automatically without needing to list them separately.
 RABBIT_BLOCKS = [
-    # ("R24-101", 11),
-    # ("R24-058", 6),
-    # ("R24-240", 3),
+    ("R24-082", 5),
+    ("R24-240", 3),
+    ("R24-103", 6),
+    ("R23-055", 7),
 ]
 
 def registered_czi_paths(rabbit_id, block_no, ceph_base=CEPH_BASE):
