@@ -8,8 +8,8 @@ from FinalRegProcessingPipeline import MultiStepReg
 # Config — edit these per run
 # ---------------------------------------------------------------------------
 RABBIT_FOLDER = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RABBIT_ID     = 'R24-082'
-BLOCK         = 5
+RABBIT_ID     = 'R24-058'
+BLOCK         = 6
 END_FIXED     = 'BlockFace'
 
 MOD = 12  # 6mm at 0.5mm voxel spacing — safe margin for continuous deformation

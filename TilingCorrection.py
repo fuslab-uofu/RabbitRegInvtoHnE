@@ -25,7 +25,7 @@ Ref_path = os.path.join(CEPH_BASE, "users/jbonaventura/RabbitRegistrationProj/Re
 # same convention TilesToVoxels.py already uses), so un-registered edge slices are
 # skipped automatically without needing to list them separately.
 RABBIT_BLOCKS = [
-    # ("R24-101", 11),
+    ("R23-292", 4),
     # ("R24-058", 6),
     # ("R24-240", 3),
 ]
@@ -608,6 +608,16 @@ def read_corrected_czi(output_path, page=0):
 
 #Establish a tiling intensity profile
 for rabbit_id, block_no, path in test_slides:
+    # rabbit_block_output_dir creates NormalizedFull via os.makedirs(exist_ok=True), so this
+    # is safe to call even the first time for a block, before that folder exists yet.
+    output_dir = rabbit_block_output_dir(rabbit_id, block_no)
+    output_tiff_path = os.path.join(output_dir,
+                                     os.path.splitext(os.path.basename(path))[0] + "_corrected_fullres.tif")
+    if os.path.exists(output_tiff_path):
+        print(f"SKIPPING {os.path.basename(path)} (rabbit {rabbit_id}, block {block_no}): "
+              f"already normalized at {output_tiff_path}")
+        continue
+
     img, mask, background_tiles, tissue_tiles, dark_anomaly_tiles = find_background_tiles(path)
     if not background_tiles:
         print(f"SKIPPING {os.path.basename(path)} (rabbit {rabbit_id}, block {block_no}): "
@@ -643,9 +653,6 @@ for rabbit_id, block_no, path in test_slides:
         plt.title(os.path.basename(path) + " (reconstructed, corrected, tile-by-tile placement)")
         plt.show()
 
-    output_dir = rabbit_block_output_dir(rabbit_id, block_no)
-    output_tiff_path = os.path.join(output_dir,
-                                     os.path.splitext(os.path.basename(path))[0] + "_corrected_fullres.tif")
     result_path = write_corrected_czi(path, coeffs_per_channel, output_tiff_path, scale_factor=1)
     if result_path is None:
         continue

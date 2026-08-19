@@ -96,6 +96,8 @@ def find_day3_paths(RabbitID, pathtoRabbits):
         elif category == 'End':     end_vols.append(path)
         elif category == 'Fixed':   fixed_vols.append(path)
 
+    day3end_registered_dir = os.path.join(os.path.dirname(day3_dir), 'Day3End_Registered')
+
     return {
         'day3_dir':            day3_dir,
         'start_vols':          start_vols,
@@ -104,6 +106,9 @@ def find_day3_paths(RabbitID, pathtoRabbits):
         'transform_path':      os.path.join(day3_dir, 'Day3_end_to_start_Transform.h5'),
         'inv_transform_cache': os.path.join(day3_dir, 'Day3_end_to_start_inv_cached.h5'),
         'aps_transform_folder': os.path.join(os.path.dirname(day3_dir), 'Transforms'),
+        'day3end_registered_dir': day3end_registered_dir,
+        # Day3 start/fixed volumes already resampled onto the End-Day3 (target_space="InVivo") grid
+        'registered_vols':     sorted(glob.glob(os.path.join(day3end_registered_dir, '*_regToDay3End.nii.gz'))),
     }
 
 

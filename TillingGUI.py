@@ -543,8 +543,8 @@ class TillingGUI(QMainWindow):
         self.canvas.draw()
 
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R24-101"
-Block = 11
+RabbitID="R21-052"
+Block = 6
 
 if __name__ == '__main__':
     blockId = "Block" + f"{Block:02d}"

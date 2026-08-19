@@ -33,7 +33,7 @@ os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 # Paths — edit these two lines per rabbit
 # ---------------------------------------------------------------------------
 RABBIT_FOLDER = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RABBIT_ID     = 'R24-240'
+RABBIT_ID     = 'R24-101'
 
 _base     = os.path.join(RABBIT_FOLDER, RABBIT_ID, 'InVivo_MR', 'InVMRDataSets')
 DAY3_DIR  = os.path.join(_base, 'Day3')
@@ -346,11 +346,22 @@ def build_day3end_to_day0_field(day3_end_nib, day3_start_nib, inv_composite,
     del phys_ras
 
     # Physical RAS → APS voxel (0-indexed).
-    # The APS fields live in Day3_end/Day0 orientation (384, 144, 512).
-    # Day3_start NIfTI has Y and Z swapped (384, 512, 144), so using its affine
-    # here would put coordinates into the wrong axis ordering for the APS fields.
+    # The APS fields' domain is whatever raw on-disk orientation the Day0
+    # volumes are stored in (loaded with no reorientation below) — NOT
+    # nibabel's canonical RAS+. Reorient Day3_start to match Day0's native
+    # orientation (rather than forcing RAS+) to get an affine usable for this
+    # lookup, since Day3_start/Day3_end on-disk orientation varies per rabbit
+    # and can't be trusted directly. Verified to reproduce the known-good
+    # affine exactly on rabbits where a native APS-oriented Day3 volume also
+    # exists for comparison.
+    day0_ref_nib = nib.load(sorted(glob.glob(os.path.join(DAY0_DIR, 'Masked', '*.nii.gz')))[0])
+    ornt_xfm     = nib.orientations.ornt_transform(
+        nib.io_orientation(day3_end_nib.affine),
+        nib.io_orientation(day0_ref_nib.affine),
+    )
+    aps_affine     = day3_end_nib.as_reoriented(ornt_xfm).affine
     hom            = np.column_stack([day3start_ras, np.ones(N, dtype=np.float32)])
-    day3start_vox  = (np.linalg.inv(day3_end_nib.affine) @ hom.T).T[:, :3].astype(np.float32)
+    day3start_vox  = (np.linalg.inv(aps_affine) @ hom.T).T[:, :3].astype(np.float32)
     del day3start_ras, hom
 
     if APS_INV_METHOD == 'sitk':

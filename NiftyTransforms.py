@@ -187,8 +187,26 @@ def FlattenBack(Varray, Myrange):
 
 
 
+def resolve_threshold_field(value, shape):
+    """Resolve a thresh/maskthresh spec to a scalar or a per-voxel field matching
+    `shape`. `value` is a plain number, or a string formula in x, y, z (the voxel
+    index along array axes 0, 1, 2) for a directional threshold that compensates for
+    a coil-inhomogeneity gradient, e.g. '10+4x'. Only x, y, z, and np are available
+    in formulas."""
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return value
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    x, y, z = np.indices(shape)
+    return eval(value, {'__builtins__': {}}, {'x': x, 'y': y, 'z': z, 'np': np})
+
+
 def makesegfromvol(vol_array, thresh=70, maskthresh=160, kernsize=10):
-    mask = TakeOutBack(vol_array, thresh, maskthresh, kernsize)
+    thresh_field = resolve_threshold_field(thresh, vol_array.shape)
+    maskthresh_field = resolve_threshold_field(maskthresh, vol_array.shape)
+    mask = TakeOutBack(vol_array, thresh_field, maskthresh_field, kernsize)
 
     # Keep only the largest connected component — removes edge artifacts and noise
     labeled, n_components = ndimage_label(mask)
