@@ -28,7 +28,7 @@ DEFAULT_MASKTHRESH = 160
 DEFAULT_KERNSIZE = 10
 
 
-def _resolve_cropped_path(fixed_folder):
+def resolve_cropped_path(fixed_folder):
     """The raw ExVivo-block scan's filename convention varies a lot across rabbits --
     seen so far: ExVivoBlock{NN}Cropped (R24-058), ExVMR_Block{NN}Cropped (R23-055),
     and on R24-103 alone: ExVivoMR_Block4 (no zero-pad, no "Cropped"),
@@ -76,7 +76,7 @@ def discover_blocks(RabbitID, RabbitFolder):
         block_suffix = f"{block:02d}"
         paths = find_all_the_paths(RabbitID, block, RabbitFolder, 'ExVivo')
 
-        cropped_path = _resolve_cropped_path(paths['Fixed_Folder'])
+        cropped_path = resolve_cropped_path(paths['Fixed_Folder'])
         resampled_path = os.path.join(paths['RegDataProc'], f"ExVivoResampledToExVivoBlock{block_suffix}.nii.gz")
         if cropped_path is None:
             print(f"  Skipping Block{block_suffix}: no Cropped scan found")
@@ -130,7 +130,7 @@ def tune_mask_interactively(vol_arr, thresh, maskthresh, kernsize, n_slices=5):
             lambda p, m, i: (p[:, i, :], m[:, i, :]),
             lambda p, m, i: (p[:, :, i], m[:, :, i]),
         ]
-        fig, axs = plt.subplots(6, n_slices, figsize=(3 * n_slices, 16))
+        fig, axs = plt.subplots(6, n_slices, figsize=(2 * n_slices, 9))
         for axis in range(3):
             idxs = np.linspace(0, vol_arr.shape[axis] - 1, n_slices).astype(int)
             row_axis, col_axis = _PLANE_AXES[axis]
@@ -159,41 +159,20 @@ def tune_mask_interactively(vol_arr, thresh, maskthresh, kernsize, n_slices=5):
 
 def mask_and_histmatch_block(RabbitID, Block, RabbitFolder, thresh=DEFAULT_THRESH,
                               maskthresh=DEFAULT_MASKTHRESH, kernsize=DEFAULT_KERNSIZE,
-                              interactive=True):
+                              interactive=True, make_mask=True):
+    """make_mask=False skips masking/histogram-matching entirely and instead loads
+    the already-saved masked(+matched) volumes from a prior make_mask=True run, then
+    only recomputes and overwrites the *_binned outputs -- for rerunning binning
+    (e.g. after a bin_intensities change) without redoing the interactive masking
+    step. thresh/maskthresh/kernsize are unused in that case."""
     paths = find_all_the_paths(RabbitID, Block, RabbitFolder, 'ExVivo')
     block_suffix = f"{Block:02d}"
 
-    moving_path = os.path.join(paths['RegDataProc'], f"ExVivoResampledToExVivoBlock{block_suffix}.nii.gz")
-    fixed_path = _resolve_cropped_path(paths['Fixed_Folder'])
+    fixed_path = resolve_cropped_path(paths['Fixed_Folder'])
     if fixed_path is None:
         raise FileNotFoundError(f"No raw scan (*.nii/*.nii.gz) found in {paths['Fixed_Folder']}")
 
-    # Already resampled into the fixed volume's canonical space by PrepForLandMarker,
-    # so no re-canonicalization needed here -- just load it.
-    resampled = nib.load(moving_path).get_fdata().astype(np.float32)
-
     fixed_nib_canonical = nib.as_closest_canonical(nib.load(fixed_path))
-    fixed_array = fixed_nib_canonical.get_fdata().astype(np.float32)
-
-    # Normalize both volumes to [0, 255] before masking and matching
-    resampled_norm = resampled / np.max(resampled) * 255 if np.max(resampled) > 0 else resampled
-    fixed_norm = fixed_array / np.max(fixed_array) * 255 if np.max(fixed_array) > 0 else fixed_array
-
-    if interactive:
-        mask, thresh, maskthresh, kernsize = tune_mask_interactively(fixed_norm, thresh, maskthresh, kernsize)
-    else:
-        mask = makesegfromvol(fixed_norm, thresh, maskthresh, kernsize)
-
-    print(f"[{RabbitID} Block{block_suffix}] mask covers {100 * mask.mean():.1f}% of the volume "
-          f"({mask.sum()}/{mask.size} voxels) -- thresh={thresh} maskthresh={maskthresh} kernsize={kernsize}")
-
-    resampled_masked = resampled_norm * mask
-    fixed_masked = fixed_norm * mask
-
-    resampled_matched = match_histograms(resampled_masked, fixed_masked)
-
-    resampled_binned = bin_intensities(resampled_matched)
-    fixed_binned = bin_intensities(fixed_masked)
 
     fixed_output_dir = os.path.join(paths['Fixed_Folder'], 'RegDataProc')
     os.makedirs(paths['RegDataProc'], exist_ok=True)
@@ -204,14 +183,46 @@ def mask_and_histmatch_block(RabbitID, Block, RabbitFolder, thresh=DEFAULT_THRES
     fixed_out = os.path.join(fixed_output_dir, f"ExVivoBlock{block_suffix}Masked.nii.gz")
     fixed_binned_out = os.path.join(fixed_output_dir, f"ExVivoBlock{block_suffix}Masked_binned.nii.gz")
 
-    nib.save(nib.Nifti1Image(DimsDivFour(resampled_matched).astype(np.float32), fixed_nib_canonical.affine), moving_out)
+    if make_mask:
+        moving_path = os.path.join(paths['RegDataProc'], f"ExVivoResampledToExVivoBlock{block_suffix}.nii.gz")
+        # Already resampled into the fixed volume's canonical space by
+        # PrepForLandMarker, so no re-canonicalization needed here -- just load it.
+        resampled = nib.load(moving_path).get_fdata().astype(np.float32)
+        fixed_array = fixed_nib_canonical.get_fdata().astype(np.float32)
+
+        # Normalize both volumes to [0, 255] before masking and matching
+        resampled_norm = resampled / np.max(resampled) * 255 if np.max(resampled) > 0 else resampled
+        fixed_norm = fixed_array / np.max(fixed_array) * 255 if np.max(fixed_array) > 0 else fixed_array
+
+        if interactive:
+            mask, thresh, maskthresh, kernsize = tune_mask_interactively(fixed_norm, thresh, maskthresh, kernsize)
+        else:
+            mask = makesegfromvol(fixed_norm, thresh, maskthresh, kernsize)
+
+        print(f"[{RabbitID} Block{block_suffix}] mask covers {100 * mask.mean():.1f}% of the volume "
+              f"({mask.sum()}/{mask.size} voxels) -- thresh={thresh} maskthresh={maskthresh} kernsize={kernsize}")
+
+        resampled_masked = resampled_norm * mask
+        fixed_masked = fixed_norm * mask
+
+        resampled_matched = match_histograms(resampled_masked, fixed_masked)
+
+        nib.save(nib.Nifti1Image(DimsDivFour(resampled_matched).astype(np.float32), fixed_nib_canonical.affine), moving_out)
+        nib.save(nib.Nifti1Image(DimsDivFour(fixed_masked).astype(np.float32), fixed_nib_canonical.affine), fixed_out)
+        print(f"[{RabbitID} Block{block_suffix}] Saved masked+matched moving to {moving_out}")
+        print(f"[{RabbitID} Block{block_suffix}] Saved masked fixed to {fixed_out}")
+    else:
+        print(f"[{RabbitID} Block{block_suffix}] make_mask=False -- loading existing masked volumes from disk")
+        resampled_matched = nib.load(moving_out).get_fdata().astype(np.float32)
+        fixed_masked = nib.load(fixed_out).get_fdata().astype(np.float32)
+
+    resampled_binned = bin_intensities(resampled_matched)
+    fixed_binned = bin_intensities(fixed_masked)
+
     nib.save(nib.Nifti1Image(DimsDivFour(resampled_binned).astype(np.float32), fixed_nib_canonical.affine), moving_binned_out)
-    nib.save(nib.Nifti1Image(DimsDivFour(fixed_masked).astype(np.float32), fixed_nib_canonical.affine), fixed_out)
     nib.save(nib.Nifti1Image(DimsDivFour(fixed_binned).astype(np.float32), fixed_nib_canonical.affine), fixed_binned_out)
 
-    print(f"[{RabbitID} Block{block_suffix}] Saved masked+matched moving to {moving_out}")
     print(f"[{RabbitID} Block{block_suffix}] Saved masked+matched+binned moving to {moving_binned_out}")
-    print(f"[{RabbitID} Block{block_suffix}] Saved masked fixed to {fixed_out}")
     print(f"[{RabbitID} Block{block_suffix}] Saved masked+binned fixed to {fixed_binned_out}")
 
     return thresh, maskthresh, kernsize
@@ -219,7 +230,7 @@ def mask_and_histmatch_block(RabbitID, Block, RabbitFolder, thresh=DEFAULT_THRES
 
 if __name__ == '__main__':
     RabbitFolder = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-    RabbitID = 'R23-295'
+    RabbitID = 'R24-124'
 
     blocks = discover_blocks(RabbitID, RabbitFolder)
     print(f"Found {len(blocks)} block(s) ready to process for {RabbitID}: {blocks}")
@@ -230,5 +241,5 @@ if __name__ == '__main__':
         # block -- block-to-block masking params should be similar, so after the
         # first block or two this should mostly just mean hitting 'y'.
         thresh, maskthresh, kernsize = mask_and_histmatch_block(
-            RabbitID, Block, RabbitFolder, thresh, maskthresh, kernsize
+            RabbitID, Block, RabbitFolder, thresh, maskthresh, kernsize, make_mask=True
         )

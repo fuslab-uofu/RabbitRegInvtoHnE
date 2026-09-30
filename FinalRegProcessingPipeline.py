@@ -6,19 +6,20 @@ import numpy as np
 import nibabel as nib
 from ApplyTransforms import *
 from RabbitPathFinder import *
+from ComposedTransformReg import ComposedReg
 from datetime import datetime
 import matplotlib.pyplot as plt
 import glob
 
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R21-052"
-Block = 6
+RabbitID="R24-064"
+Block = 4
 
 #If we're working from a directory->
 RegDir = os.path.join(RabbitFolder, RabbitID, 'InVivo_MR', 'InVMRDataSets', 'Day3End_Registered')
 
-#Generalizing to be able to do multiple steps->
+#Old registration technique, resampling at each step->
 #Provide key for moving and final fixed volume. Options- ["InVivo", "ExVivo", "ExVivoBlock", "Blockface"]
 def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpolation='nearest', moving_path=None, save=True):
     PROGRESSION = ["InVivo", "ExVivo", "ExVivoBlock", "BlockFace"]
@@ -32,6 +33,7 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpola
 
     # interpolation='nearest' preserves original voxel values across all resampling steps (recommended for voxel-level analysis)
     # interpolation='linear' blends values at each step (smoother edges, but compounding blur across multiple steps)
+    #Perhaps add trilinear interpolation here->
     sitk_interp  = sitk.sitkNearestNeighbor if interpolation == 'nearest' else sitk.sitkLinear
     dfield_order = 0                         if interpolation == 'nearest' else 1
 
@@ -44,6 +46,7 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpola
         current_volume = None
         current_affine = None
 
+    #For each registration step->
     for i in range(start_idx, end_idx):
         moving_key = PROGRESSION[i]
         paths = find_all_the_paths(RabbitID, Block, RabbitFolder, moving_key)
@@ -84,7 +87,7 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpola
 
 def MultiStepRegDir(input_dir, RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpolation='nearest', out_dir_name=None):
     """
-    Run MultiStepReg on every .nii.gz in input_dir, using each file as the moving volume.
+    Run ComposedReg on every .nii.gz in input_dir, using each file as the moving volume.
 
     Outputs land in {RegDataOut}/{input_dir_name}_RegTo{end_label}/
     Output filenames: {first_two_parts_of_stem}_{regTo_suffix}_RegTo{end_label}.nii.gz
@@ -115,8 +118,8 @@ def MultiStepRegDir(input_dir, RabbitID, Block, RabbitFolder, MovingStart, EndFi
             out_path    = os.path.join(out_dir, out_name)
 
             print(f"Processing {os.path.basename(vol_path)} → {out_name}")
-            result, affine = MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed,
-                                          interpolation=interpolation, moving_path=vol_path, save=False)
+            result, affine = ComposedReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed,
+                                         interpolation=interpolation, moving_path=vol_path, save=False)
             nib.save(nib.Nifti1Image(result, affine), out_path)
             print(f"  Saved → {out_path}")
 
@@ -144,8 +147,8 @@ def MultiStartRegToFixed(RabbitID, Block, RabbitFolder, EndFixed, interpolation=
 
     for moving_key in PROGRESSION[:end_idx]:
         print(f"Registering {moving_key} → {EndFixed}...")
-        result, affine = MultiStepReg(RabbitID, Block, RabbitFolder, moving_key, EndFixed,
-                                      interpolation=interpolation, save=False)
+        result, affine = ComposedReg(RabbitID, Block, RabbitFolder, moving_key, EndFixed,
+                                     interpolation=interpolation, save=False)
         save_paths = find_all_the_paths(RabbitID, Block, RabbitFolder, moving_key)
         out_dir = save_paths['RegDataOut']
         os.makedirs(out_dir, exist_ok=True)
@@ -155,16 +158,11 @@ def MultiStartRegToFixed(RabbitID, Block, RabbitFolder, EndFixed, interpolation=
         print(f"  Saved → {out_path}")
 
 if __name__ == '__main__':
-    MultiStartRegToFixed(RabbitID, Block, RabbitFolder, "BlockFace")
+    MultiStartRegToFixed(RabbitID, Block, RabbitFolder, "BlockFace", "linear")
 
     # Single file run through-
     #MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='nearest')
 
     # Run through all the files in a directory-
     #MultiStepRegDir(RegDir, RabbitID, Block, RabbitFolder,"InVivo", "BlockFace",interpolation='nearest')
-
-#Buggy- needs work before implementation
-# resampled=compose_e_resample(SlicerTPath, dfieldpath, fixed_image, moving_image)
-# output_path2 = os.path.join(paths['RegDataOut'], f"OneStepTransformApply{timestamp}.nii.gz")
-# sitk.WriteImage(resampled, output_path2)
 

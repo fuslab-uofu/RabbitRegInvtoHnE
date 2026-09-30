@@ -37,10 +37,21 @@ def match_histograms(source, template):
     return matched
 
 def bin_intensities(vol, n_bins=8):
-    """Quantize intensities into n_bins equal-width steps over [0, 255].
-    Zero voxels (background) remain zero regardless of bin boundaries."""
-    stepsize = 255 // n_bins
-    binned = (np.floor(vol / stepsize) * stepsize).astype(np.float32)
+    """Quantize intensities into n_bins equal-width steps spanning this volume's own
+    non-zero [min, max] range (not a fixed [0, 255] scale), so the number of
+    populated bins stays consistent regardless of how much dynamic range survived
+    masking/histogram-matching. Zero voxels (background) remain zero regardless of
+    bin boundaries."""
+    nonzero = vol[vol != 0]
+    if nonzero.size == 0:
+        return np.zeros_like(vol, dtype=np.float32)
+    vmin, vmax = nonzero.min(), nonzero.max()
+    stepsize = (vmax - vmin) / n_bins
+    if stepsize == 0:
+        binned = np.full_like(vol, vmin, dtype=np.float32)
+    else:
+        bin_idx = np.clip(np.floor((vol - vmin) / stepsize), 0, n_bins - 1)
+        binned = (bin_idx * stepsize + vmin).astype(np.float32)
     binned[vol == 0] = 0
     return binned
 

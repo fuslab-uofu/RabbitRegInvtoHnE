@@ -278,6 +278,7 @@ def trace_by_id(label_slice_us, tile_mask, splines, pad=3):
         if sl is None:
             continue
         vid = int(present_ids[idx])
+        #Crop to region surrounding vox ID-
         y0, y1 = max(0, sl[0].start - pad), min(H, sl[0].stop + pad)
         x0, x1 = max(0, sl[1].start - pad), min(W, sl[1].stop + pad)
 
@@ -295,6 +296,7 @@ def trace_by_id(label_slice_us, tile_mask, splines, pad=3):
             poly = Polygon(pts)
 
             bf_pts = np.array(poly.exterior.coords)
+            #Polygon transformed back to full res HnE space->
             hne_pts = splines(bf_pts[:, ::-1])
             hne_poly = Polygon(hne_pts)
             if not hne_poly.is_valid:
@@ -366,20 +368,24 @@ if __name__ == '__main__':
     reg_HnE_dir = os.path.join(hne_base_dir, 'Registered')
     # Unique-ID label volume from MakeVoxelVolV2.py, already registered to BlockFace.
     # Requires MakeVoxelVolV2.py to have been run for this same Rabbit/Block first.
-    PAD_VOXELS = 20
     reg_show = os.path.join(rabbase, 'InVivo_MR/RegDataProc/Voxel_Maps',
-                             f'voxel_tile_vol_unique_pad{PAD_VOXELS}_ComposedRegTo{Block}.nii.gz')
+                             f'voxel_tile_vol_ComposedRegTo{Block}.nii.gz')
 
     bf_cropped_dir = os.path.join(rabbase, 'BlockFace_RGB', Block, 'CroppedImages')
     print(bf_cropped_dir)
 
     label_nib = nib.load(reg_show)
+    #Array of registered voxel volume->
     label_arr = label_nib.get_fdata()
+    #Correct axis orientation misalignment->
     if label_nib.affine[0, 0] > 0 and label_nib.affine[1, 1] > 0:
         label_arr = label_arr[::-1, ::-1, :]
 
+    #Grab registered H&E files-
     hne_filenames = sorted(f for f in os.listdir(reg_HnE_dir) if f.lower().endswith('reg.png') and not f.startswith('._'))
+    #Get blockface Indicies from H&E names-
     hne_bf_indices = [re.search(r'\d+', f).group()[-2:] for f in hne_filenames]
+    #Stack H&E files into an array-
     hne_images = [np.array(Image.open(os.path.join(reg_HnE_dir, f))) for f in hne_filenames]
     reg_HnE_arr = np.stack(hne_images, axis=2)  # (H, W, N_slices, 3)
 
@@ -387,7 +393,7 @@ if __name__ == '__main__':
     print(label_arr.shape)
     print(hne_bf_indices[0])
 
-    Show_Plots = True
+    Show_Plots = False
     Show_Duplicate_Diagnostics = False
     scale_fac = 20  # scale factor between HnE raw and downsampled
     geoms_dir = os.path.join(rabbase, 'Analysis', Block)
@@ -396,35 +402,14 @@ if __name__ == '__main__':
     all_dupe_ids_seen = set()  # every voxel ID flagged as 2D-duplicated on any slide,
                                 # for a single 3D connectivity pass once the loop ends
 
-    # --- 3D tissue mask, built from the sparse per-slide H&E tissue masks and extended
-    # across BlockFace's much finer z-spacing via nearest-real-slide lookup (the same
-    # "uniform cross section" nearest-neighbor logic the label volume itself already
-    # relies on to span the same gaps). Used below to constrain the 3D connectivity
-    # check to real tissue -- the ExVivo->ExVivoBlock stage field-jump investigation
-    # found disconnected-in-3D voxels concentrating in a boundary/background region, so
-    # this should suppress that specific known artifact. Real caveat, not swept under
-    # the rug: a too-tight mask could also cut a genuine bridge between two truly-
-    # connected parts of a voxel -- re-examine whatever's still flagged afterward with
-    # PlotDisconnectedFragments.py. ---
-    tissue_mask_3d = np.zeros(label_arr.shape, dtype=bool)
-    assigned_slice_nums = []
-
     # --- InVivo slide-map sanity check: paint the ORIGINAL InVivo MR volume by
-    # which H&E slide each voxel ended up on, straight from MakeVoxelVolV2.py's
-    # id_lookup.npy (voxel_id -> (i,j,k) in native InVivo space, assigned before any
-    # registration ran) -- no transform propagation needed, unlike
-    # FeatureCrossAnalysis.py's tile-outline projection, since this correspondence
-    # already exists exactly. This looks at the transform chain from the opposite
-    # direction of everything else in this script: if it's behaving, walking through
-    # InVivo space along the true physical sectioning direction should show a clean,
-    # monotonic, layered progression of slide values -- scattered/non-monotonic
-    # painting is a visible signal of a registration discontinuity. ---
-    Build_InVivo_Slide_Map = True
+    # which H&E slide each voxel ended up on-
+    Build_InVivo_Slide_Map =False
     if Build_InVivo_Slide_Map:
         invivo_paths = find_all_the_paths(Rabbit, block_no, root_dir, 'InVivo')
         invivo_ref_nib = nib.load(str(invivo_paths['Moving_FilePath']))
         voxel_maps_dir = os.path.join(rabbase, 'InVivo_MR/RegDataProc/Voxel_Maps')
-        lookup_path = os.path.join(voxel_maps_dir, f'voxel_tile_vol_unique_pad{PAD_VOXELS}_id_lookup.npy')
+        lookup_path = os.path.join(voxel_maps_dir, 'voxel_tile_vol_id_lookup.npy')
         id_lookup = np.load(lookup_path)  # id_lookup[id-1] = (i,j,k) in InVivo space
         invivo_slide_map = np.zeros(invivo_ref_nib.shape[:3], dtype=np.float32)
         invivo_paint_count = np.zeros(invivo_ref_nib.shape[:3], dtype=np.int32)
@@ -438,9 +423,11 @@ if __name__ == '__main__':
         # Finding tps transform between CZI and blockface -
         img_number = re.search(r'\d+', hne_filenames[img]).group()  # e.g. '0011'
         landmarks = load_landmarks(hne_base_dir, img_number)
+        #Find CZI file-
         CZI_filepath = CSV_CZI_lookup(Rabbit, Block, img_number, ceph_base=CEPH_BASE)
         czi_stem = os.path.splitext(os.path.basename(CZI_filepath))[0]
 
+        #Sort Landmarks and reform Splines transform->
         src = np.array([[p.y(), p.x()] for p in landmarks[0]]) * 3  # fixed
         dst = np.array([[p.x(), p.y()] for p in landmarks[1]]) * 3  # H&E
         splines = ski.transform.ThinPlateSplineTransform.from_estimate(src, dst)
@@ -448,18 +435,17 @@ if __name__ == '__main__':
         # Use blockface filename position in CroppedImages to find the correct NIfTI slice -
         slice_num = get_bf_slice_index(bf_cropped_dir, img_number)
         print(slice_num)
+        #Pull Slice from voxel vol corresponding to HnE slide->
         label_slice = label_arr[:, :, slice_num].T
         print("label_slice info", np.max(label_slice), np.min(label_slice))
-        # Upsampling by 4 this is for visualization and tile extraction purposes - not for analysis -
+        # Upsampling by 4 to pull to registered HNE resolution-
         label_slice_us = np.repeat(np.repeat(label_slice, 4, axis=0), 4, axis=1)
         label_slice_us = label_slice_us[:hne_ds_im.shape[0], :hne_ds_im.shape[1]]
 
         print(hne_ds_im.shape, label_slice_us.shape)
 
+        #Mask tissue area in HnE slide->
         tile_mask = make_tissue_mask(reg_HnE_arr[:, :, img, :])
-        mask_native = downsample_mask_or(tile_mask, label_slice.shape)
-        tissue_mask_3d[:, :, slice_num] = mask_native.T
-        assigned_slice_nums.append(slice_num)
 
         if Show_Plots:
             fig, axes = plt.subplots(1, 3, figsize=(15, 8))
@@ -487,11 +473,7 @@ if __name__ == '__main__':
         elapsed = time.perf_counter() - t0
         print(f"Slice {img}: {len(hne_polys)} valid polygons, {n_invalid} dropped as invalid ({elapsed:.1f}s)")
 
-        # --- Check for voxel IDs traced as multiple fragments. No merge step for now
-        # (merge_touching_fragments pulled out — see conversation notes: its point-
-        # touch closing had a real data-loss bug, and a proper fix needs rethinking
-        # how a corner-touch pair should be represented, not just a buffer-radius
-        # tweak). Fragments stay separate under the same poly_id until that's settled. ---
+        # --- Check for voxel IDs traced as multiple fragments.
         id_counts = Counter(poly_ids)
         dupes = {vid: n for vid, n in id_counts.items() if n > 1}
         if dupes:
@@ -505,17 +487,7 @@ if __name__ == '__main__':
                                          slice_label=f' (slice {hne_Name})')
                 plot_duplicate_examples(label_slice_us, tile_mask, dupes, poly_ids, bf_polys)
 
-        # --- Paint this slide's voxel IDs into the InVivo slide map. slide_value =
-        # (slice_num+1)*100 -- offset by 1 so a slice_num of 0 never collides with
-        # unpainted background (both would otherwise read as 0) -- and *100 so
-        # consecutive slides are easy to tell apart visually. Every voxel here has
-        # already passed trace_by_id's tile_mask intersection, so this isn't padded-
-        # mask overlap: MR voxels are 0.5mm and sections are cut every 0.25mm, so a
-        # single MR voxel spanning 2 physical sections is expected geometry, not a
-        # registration error. Overwritten on conflict (last slide wins) but the
-        # slice_num distance to the previous slide is recorded each time, so we can
-        # tell "expected overlap with the immediate physical neighbor" apart from a
-        # genuine discontinuity (competing slides that aren't actually adjacent). ---
+        # --- Paint this slide's voxel IDs into the InVivo slide map-
         if Build_InVivo_Slide_Map:
             slide_value = (slice_num + 1) * 100
             for vid in set(poly_ids):
@@ -554,7 +526,7 @@ if __name__ == '__main__':
         print(f"Saved {len(geojson_features)} polygons to {geojson_path}")
 
     if Build_InVivo_Slide_Map:
-        slide_map_path = os.path.join(geoms_dir, f'invivo_slide_map_pad{PAD_VOXELS}.nii.gz')
+        slide_map_path = os.path.join(geoms_dir, 'invivo_slide_map.nii.gz')
         nib.save(nib.Nifti1Image(invivo_slide_map, invivo_ref_nib.affine, invivo_ref_nib.header), slide_map_path)
         n_painted = int((invivo_paint_count > 0).sum())
         print(f"Saved InVivo slide-map volume to {slide_map_path}")
@@ -571,14 +543,6 @@ if __name__ == '__main__':
         for d, n in sorted(dist_counts.items()):
             print(f"    slice_num distance={d} (~{d * bf_z_spacing_mm:.3f} mm): {n} conflict(s)")
 
-    # Nearest-neighbor z-fill: every BlockFace z-slice without a directly-assigned real
-    # H&E slide just copies whichever real slide's own slice_num is closest -- the
-    # "uniform cross section" extension across the gaps between real physical sections.
-    z_indices = np.arange(label_arr.shape[2])
-    assigned_arr = np.array(sorted(set(assigned_slice_nums)))
-    nearest_slice_num = assigned_arr[np.abs(z_indices[:, None] - assigned_arr[None, :]).argmin(axis=1)]
-    tissue_mask_3d_filled = tissue_mask_3d[:, :, nearest_slice_num]
-
     # --- 3D connectivity check: every voxel ID flagged as split within some 2D
     # slice, re-checked against the full registered 3D label volume. A split that
     # disappears in 3D was a slicing-plane artifact (the cross-section cut through
@@ -586,5 +550,3 @@ if __name__ == '__main__':
     if all_dupe_ids_seen:
         print(f"3D connectivity check across {len(all_dupe_ids_seen)} voxel ID(s) flagged as split in some slice:")
         connected_in_3d_ids, disconnected_in_3d_ids = summarize_3d_connectivity(all_dupe_ids_seen, label_arr)
-        np.save(os.path.join(geoms_dir, f'connected_in_3d_ids_pad{PAD_VOXELS}.npy'), np.array(connected_in_3d_ids))
-        np.save(os.path.join(geoms_dir, f'disconnected_in_3d_ids_pad{PAD_VOXELS}.npy'), np.array(disconnected_in_3d_ids))

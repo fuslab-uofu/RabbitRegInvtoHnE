@@ -8,7 +8,6 @@ import SimpleITK as sitk
 import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt
 from RabbitPathFinder import find_all_the_paths
-from FinalRegProcessingPipeline import MultiStepReg
 from ComposedTransformReg import ComposedReg
 from ApplyTransforms import nib_to_sitk
 from NiftyTransforms import makesegfromvol
@@ -21,9 +20,7 @@ RABBIT_ID     = 'R24-058'
 BLOCK         = 6
 END_FIXED     = 'BlockFace'
 
-# ExVivo tissue mask (makesegfromvol defaults — same TakeOutBack core as
-# ResampleToDay3End.py's build_body_mask, plus a largest-connected-component
-# filter that drops the bright edge artifacts ExVivo scans sometimes have)
+# ExVivo tissue mask- initial threshold, then convlutional filter applied with kernsize, then thresholded again-
 RETUNE_EXVIVO_MASK     = True
 EXVIVO_MASK_THRESH     = 70
 EXVIVO_MASK_MASKTHRESH = 160
@@ -31,13 +28,9 @@ EXVIVO_MASK_KERNSIZE   = 10
 
 FLOAT32_EXACT_INT_CEILING = 2 ** 24  # largest integer float32 can represent exactly
 
-# Pad amounts (voxels, isotropic) to sweep when checking how close padding gets us
-# to the float32 ceiling. 0.5mm voxel spacing, so e.g. 20 voxels = 10mm.
-PAD_VOXELS_TO_TEST = [0, 5, 10, 15, 20, 25, 30]
-
-# Pad amount actually used to build/save the mask below.
+# Padding applied to make Ex Vivo Mask Overflow Tissue Region-
 PAD_VOXELS = 20
-
+# _________________
 
 def _load_transform(path):
     """Load a Slicer .h5 transform via temp copy to sidestep HDF5 locking (same pattern as ResampleToDay3End.py)."""
@@ -51,9 +44,7 @@ def _load_transform(path):
 
 
 def tune_exvivo_mask_interactively(vol_arr, thresh, maskthresh, kernsize):
-    """Same interactive accept/retune loop as ResampleToDay3End.py's tune_mask_interactively,
-    swapped to makesegfromvol (adds largest-connected-component filtering on top of the
-    same TakeOutBack threshold+blur core, to reject isolated bright edge artifacts)."""
+    #Accept/retune loop to tune_mask_interactively-
     while True:
         mask = makesegfromvol(vol_arr, thresh, maskthresh, kernsize)
         mid = [s // 2 for s in vol_arr.shape]
@@ -81,12 +72,11 @@ def tune_exvivo_mask_interactively(vol_arr, thresh, maskthresh, kernsize):
 
 
 def pad_mask(mask, pad_voxels):
-    """Isotropic dilation of an arbitrary (possibly amorphous) 3D binary mask by
-    pad_voxels, using a true Euclidean distance transform rather than a discrete
-    structuring element — works the same regardless of the mask's shape/topology."""
+    #Pad mask using Euclidean distance from mask->
     if pad_voxels <= 0:
         return mask
     dist_to_mask = distance_transform_edt(~mask)
+    #Distances converted to Booleans->
     return dist_to_mask <= pad_voxels
 
 
@@ -108,79 +98,93 @@ def sweep_pad_counts(mask, pad_voxels_list):
 
 
 def make_and_register_voxel_vol(RabbitID, Block, RabbitFolder, end_fixed='BlockFace'):
+    # path finding and check if voxel volume exists already.
     paths    = find_all_the_paths(RabbitID, Block, RabbitFolder, 'InVivo')
     ref_path = str(paths['Moving_FilePath'])
-    # paths['Fixed_FilePath']/['RegFold'] here are already the InVivo->ExVivo pair —
-    # no separate find_all_the_paths(..., 'ExVivo') call needed.
-    exvivo_path    = str(paths['Fixed_FilePath'])
-    slicer_h5_path = next(p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._"))
-
-    # --- Mask ExVivo to just tissue ---
-    exvivo_nib = nib.load(exvivo_path)
-    exvivo_arr = exvivo_nib.get_fdata(dtype=np.float32)
-    if RETUNE_EXVIVO_MASK:
-        exvivo_mask, *_ = tune_exvivo_mask_interactively(
-            exvivo_arr, EXVIVO_MASK_THRESH, EXVIVO_MASK_MASKTHRESH, EXVIVO_MASK_KERNSIZE
-        )
-    else:
-        exvivo_mask = makesegfromvol(exvivo_arr, EXVIVO_MASK_THRESH, EXVIVO_MASK_MASKTHRESH, EXVIVO_MASK_KERNSIZE)
-
-    # --- Invert the InVivo<->ExVivo affine and warp the ExVivo mask into InVivo space ---
-    # sitk.Resample's transform arg always maps OUTPUT(reference) space -> INPUT(moving)
-    # space, regardless of what the transform file is named. This h5 is used elsewhere as
-    # (moving=InVivo, fixed=ExVivo), so as-loaded it already maps ExVivo -> InVivo. We want
-    # an InVivo-shaped output grid sampling the ExVivo mask, i.e. the opposite direction —
-    # hence GetInverse() here.
-    fwd_transform = _load_transform(slicer_h5_path)
-    assert fwd_transform.GetName() in ('AffineTransform', 'MatrixOffsetTransformBase'), \
-        f"Expected a bare AffineTransform, got {fwd_transform.GetName()} — this inversion approach assumes no embedded deformation field."
-    inv_affine = sitk.AffineTransform(fwd_transform).GetInverse()
-
-    invivo_ref_sitk  = sitk.ReadImage(ref_path)  # InVivo grid — defines the output space
-    exvivo_mask_sitk = nib_to_sitk(exvivo_mask.astype(np.float32), exvivo_nib.affine)
-
-    invivo_mask_sitk = sitk.Resample(
-        exvivo_mask_sitk, invivo_ref_sitk, inv_affine, sitk.sitkNearestNeighbor, 0.0
-    )
-    invivo_mask = sitk.GetArrayFromImage(invivo_mask_sitk).transpose(2, 1, 0) > 0.5
-
-    n_total = int(np.prod(nib.load(ref_path).shape[:3]))
-    print(f"ExVivo-derived InVivo-space tissue mask, before padding: "
-          f"{int(invivo_mask.sum()):,} / {n_total:,} voxels")
-
-    # --- Save the padded mask for visual QC against the InVivo structural ---
-    padded_mask = pad_mask(invivo_mask, PAD_VOXELS)
     proc_dir = os.path.join(paths['RegDataProc'], 'Voxel_Maps')
     os.makedirs(proc_dir, exist_ok=True)
-    ref = nib.load(ref_path)
-    mask_out_path = os.path.join(proc_dir, f'exvivo_derived_invivo_mask_pad{PAD_VOXELS}.nii.gz')
-    nib.save(nib.Nifti1Image(padded_mask.astype(np.uint8), ref.affine), mask_out_path)
-    print(f"Padded mask (pad={PAD_VOXELS}) saved → {mask_out_path}")
-    print(f"  {int(padded_mask.sum()):,} voxels — load alongside {ref_path} in Slicer to check coverage")
+    voxel_vol_path = os.path.join(proc_dir, 'voxel_tile_vol.nii.gz')
+    lookup_path    = os.path.join(proc_dir, 'voxel_tile_vol_id_lookup.npy')
 
-    # --- Build compact unique labels over the padded mask ---
-    # coords[id-1] == (i,j,k) for label value `id` — this lookup table is what makes
-    # the compact IDs decodable later; the label volume alone can't be inverted by
-    # arithmetic the way the old MOD-based scheme could.
-    coords = np.argwhere(padded_mask).astype(np.int32)
-    n_labels = len(coords)
-    print(f"Compact unique labels: {n_labels:,} (id 1..{n_labels:,}, 0 = background) — "
-          f"{'OK' if n_labels < FLOAT32_EXACT_INT_CEILING else 'OVER float32 CEILING'}")
+    voxel_vol_exists = os.path.exists(voxel_vol_path)
+    lookup_exists    = os.path.exists(lookup_path)
 
-    labels = np.zeros(padded_mask.shape, dtype=np.float32)
-    labels[coords[:, 0], coords[:, 1], coords[:, 2]] = np.arange(1, n_labels + 1, dtype=np.float32)
+    # Mask + labels are built once per rabbit-
+    if voxel_vol_exists and lookup_exists:
+        print(f"Voxel volume + ID lookup already exist for this rabbit — reusing "
+              f"{voxel_vol_path} instead of rebuilding, so existing voxel_id-keyed "
+              f"outputs from other blocks stay valid. Delete both this file and "
+              f"{lookup_path} together to force a full rebuild.")
+    elif voxel_vol_exists != lookup_exists:
+        raise FileNotFoundError(
+            f"Found only one of the paired voxel-volume outputs (voxel_vol_path "
+            f"exists={voxel_vol_exists}, lookup_path exists={lookup_exists}) — these "
+            f"must be regenerated together. Delete whichever one remains and re-run."
+        )
+    else:
+        exvivo_path    = str(paths['Fixed_FilePath'])
+        slicer_h5_path = next(p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._"))
 
-    lookup_path = os.path.join(proc_dir, f'voxel_tile_vol_unique_pad{PAD_VOXELS}_id_lookup.npy')
-    np.save(lookup_path, coords)
-    print(f"id -> (i,j,k) lookup table saved → {lookup_path}")
+        # --- Mask Ex Vivo to just tissue ---
+        exvivo_nib = nib.load(exvivo_path)
+        exvivo_arr = exvivo_nib.get_fdata(dtype=np.float32)
+        #Option to tweak parameters-
+        if RETUNE_EXVIVO_MASK:
+            exvivo_mask, *_ = tune_exvivo_mask_interactively(
+                exvivo_arr, EXVIVO_MASK_THRESH, EXVIVO_MASK_MASKTHRESH, EXVIVO_MASK_KERNSIZE
+            )
+        else:
+            exvivo_mask = makesegfromvol(exvivo_arr, EXVIVO_MASK_THRESH, EXVIVO_MASK_MASKTHRESH, EXVIVO_MASK_KERNSIZE)
 
-    voxel_vol_path = os.path.join(proc_dir, f'voxel_tile_vol_unique_pad{PAD_VOXELS}.nii.gz')
-    nib.save(nib.Nifti1Image(labels, ref.affine), voxel_vol_path)
-    print(f"Voxel label volume saved → {voxel_vol_path}")
+        # Invert the InVivo<->ExVivo affine and warp the ExVivo mask into InVivo space
+        fwd_transform = _load_transform(slicer_h5_path)
+        #Check that its just an affine-
+        assert fwd_transform.GetName() in ('AffineTransform', 'MatrixOffsetTransformBase'), \
+            f"Expected a bare AffineTransform, got {fwd_transform.GetName()} — this inversion approach assumes no embedded deformation field."
+        inv_affine = sitk.AffineTransform(fwd_transform).GetInverse()
 
-    # --- Register InVivo → end_fixed (nearest-neighbour to preserve label values) ---
-    print(f"Registering InVivo → {end_fixed}...")
-    result, affine = MultiStepReg(
+        invivo_ref_sitk  = sitk.ReadImage(ref_path)  # InVivo grid — defines the output space
+        exvivo_mask_sitk = nib_to_sitk(exvivo_mask.astype(np.float32), exvivo_nib.affine)
+
+        #Mask resampled to in vivo space->
+        invivo_mask_sitk = sitk.Resample(
+            exvivo_mask_sitk, invivo_ref_sitk, inv_affine, sitk.sitkNearestNeighbor, 0.0
+        )
+        #Converted to array-
+        invivo_mask = sitk.GetArrayFromImage(invivo_mask_sitk).transpose(2, 1, 0) > 0.5
+
+        #Fraction of volume covered-
+        n_total = int(np.prod(nib.load(ref_path).shape[:3]))
+        print(f"ExVivo-derived InVivo-space tissue mask, before padding: "
+              f"{int(invivo_mask.sum()):,} / {n_total:,} voxels")
+
+        # Save the padded mask for visual QC against the InVivo structural
+        padded_mask = pad_mask(invivo_mask, PAD_VOXELS)
+        ref = nib.load(ref_path)
+        mask_out_path = os.path.join(proc_dir, f'exvivo_derived_invivo_mask_pad{PAD_VOXELS}.nii.gz')
+        nib.save(nib.Nifti1Image(padded_mask.astype(np.uint8), ref.affine), mask_out_path)
+        print(f"Padded mask (pad={PAD_VOXELS}) saved → {mask_out_path}")
+        print(f"  {int(padded_mask.sum()):,} voxels — load alongside {ref_path} in Slicer to check coverage")
+
+        # --- Build compact unique labels over the padded mask ---
+        # coords[id-1] == (i,j,k) for label value `id`
+        #row of coords becomes the voxelID +1
+        coords = np.argwhere(padded_mask).astype(np.int32)
+        print(f"id -> (i,j,k) lookup table saving → {lookup_path}")
+        np.save(lookup_path, coords)
+
+        n_labels = len(coords)
+        print(f"Compact unique labels: {n_labels:,} (id 1..{n_labels:,}, 0 = background) — "
+              f"{'OK' if n_labels < FLOAT32_EXACT_INT_CEILING else 'OVER float32 CEILING'}")
+        labels = np.zeros(padded_mask.shape, dtype=np.float32)
+        #Labels applied to volume-
+        labels[coords[:, 0], coords[:, 1], coords[:, 2]] = np.arange(1, n_labels + 1, dtype=np.float32)
+
+        print(f"Voxel label volume saving → {voxel_vol_path}")
+        nib.save(nib.Nifti1Image(labels, ref.affine), voxel_vol_path)
+
+    #Register Voxel Volume to Block Face->
+    composed_result, composed_affine = ComposedReg(
         RabbitID, Block, RabbitFolder,
         'InVivo', end_fixed,
         interpolation='nearest',
@@ -191,29 +195,13 @@ def make_and_register_voxel_vol(RabbitID, Block, RabbitFolder, end_fixed='BlockF
     end_label = (end_fixed
                  .replace('ExVivoBlock', f'ExVivoBlock{Block:02d}')
                  .replace('BlockFace',   f'Block{Block:02d}'))
-    out_path = os.path.join(proc_dir, f"voxel_tile_vol_unique_pad{PAD_VOXELS}_RegTo{end_label}.nii.gz")
-    nib.save(nib.Nifti1Image(result, affine), out_path)
-    print(f"Registered voxel volume saved → {out_path}")
-    print(f"Decode: nib.load('{out_path}') voxel value v (v>0) -> "
-          f"np.load('{lookup_path}')[int(v) - 1] gives the original InVivo (i,j,k)")
-
-    # --- Same InVivo -> end_fixed registration via ComposedTransformReg's single-pass
-    # composed field (one resample instead of one per stage) — saved alongside the
-    # MultiStepReg output above, same naming convention, so the two can be loaded
-    # side by side in Slicer to check whether voxel-fragmentation is reduced. ---
-    print(f"Registering InVivo → {end_fixed} via composed transform chain...")
-    composed_result, composed_affine = ComposedReg(
-        RabbitID, Block, RabbitFolder,
-        'InVivo', end_fixed,
-        interpolation='nearest',
-        moving_path=voxel_vol_path,
-        save=False,
-    )
-    composed_out_path = os.path.join(proc_dir, f"voxel_tile_vol_unique_pad{PAD_VOXELS}_ComposedRegTo{end_label}.nii.gz")
+    composed_out_path = os.path.join(proc_dir, f"voxel_tile_vol_ComposedRegTo{end_label}.nii.gz")
     nib.save(nib.Nifti1Image(composed_result, composed_affine), composed_out_path)
     print(f"Composed-registered voxel volume saved → {composed_out_path}")
+    print(f"Decode: nib.load('{composed_out_path}') voxel value v (v>0) -> "
+          f"np.load('{lookup_path}')[int(v) - 1] gives the original InVivo (i,j,k)")
 
-    return out_path, composed_out_path, lookup_path
+    return composed_out_path, lookup_path
 
 
 if __name__ == '__main__':

@@ -25,7 +25,7 @@ global sf1234
 sf1234=3
 
 #Can set default folder here to make finding files easier->
-DEFAULT_FOLDER = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R23-058"
+DEFAULT_FOLDER = "/Users/jbonaventura/Downloads/RabbitHomework/HnEtoBF/R24-104"
 
 class ImageViewer(QDialog):
     def __init__(self, image):

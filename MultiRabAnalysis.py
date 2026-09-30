@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
+from sklearn.linear_model import LinearRegression
 from sklearn.decomposition import PCA
 from sklearn.metrics import r2_score, mean_squared_error, silhouette_score
 from xgboost import XGBRegressor
@@ -497,8 +498,10 @@ def build_model(model_type):
         return XGBRegressor(n_estimators=100, random_state=42, n_jobs=-1)
     elif model_type == "mlp":
         return MLPRegressor(hidden_layer_sizes=(100,), max_iter=1000, random_state=42)
+    elif model_type == "linear":
+        return LinearRegression()
     else:
-        raise ValueError(f"Unknown MODEL_TYPE: {model_type!r}, expected 'rf'/'xgboost'/'mlp'")
+        raise ValueError(f"Unknown MODEL_TYPE: {model_type!r}, expected 'rf'/'xgboost'/'mlp'/'linear'")
 
 
 def run_rf_cv(folds, predictor_names, target_names, target_styles=None, plot_per_fold=True, value_range=None):
@@ -1115,213 +1118,214 @@ def plot_feature_distributions_by_rabbit(rabbits, feature_names, feature_kind, g
         plt.show()
 
 
-# --- Load all slides ---
+if __name__ == '__main__':
+    # --- Load all slides ---
 
-BASE_DIR = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/"
-RABBIT_BLOCKS = {"23-055": 7, "24-103": 6, "24-240": 3, "24-082": 5}
-Rename_Doc = "/Users/jbonaventura/Documents/MR_renames.csv"
-HNE_FEATURE_OF_INTEREST = "mean_Nucleus_Hematoxylin_OD_mean"  # column from hne_names — spatial map + RF target
-# Fixed axis range for HNE_FEATURE_OF_INTEREST's predicted-value violin plot,
-# matching the true-value violin's observed range so the two are directly
-# comparable — a hardcoded range, not the percentile-based target_value_range
-# below, since this feature's scale is known and isn't expected to change.
-TARGET_DISPLAY_RANGE = (0, 2.5)
-# Which MR features to use as RF predictors: "day3" (only standardized names
-# containing "Day 3"), "day0" (only "Day 0"), or "all" (every universal MR
-# feature, Day 3 + Day 0 + Max Temp Proj mixed together).
-MR_PREDICTOR_SET = "day3"
-# Which regressor to run in every run_rf_cv call below: "rf" (RandomForestRegressor),
-# "xgboost" (XGBRegressor), or "mlp" (MLPRegressor). See build_model() for the
-# actual hyperparameters used per type.
-MODEL_TYPE = "mlp"
+    BASE_DIR = "/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/"
+    RABBIT_BLOCKS = {"23-055": 7, "24-103": 6, "24-240": 3, "24-082": 5}
+    Rename_Doc = "/Users/jbonaventura/Documents/MR_renames.csv"
+    HNE_FEATURE_OF_INTEREST = "mean_Nucleus_Hematoxylin_OD_mean"  # column from hne_names — spatial map + RF target
+    # Fixed axis range for HNE_FEATURE_OF_INTEREST's predicted-value violin plot,
+    # matching the true-value violin's observed range so the two are directly
+    # comparable — a hardcoded range, not the percentile-based target_value_range
+    # below, since this feature's scale is known and isn't expected to change.
+    TARGET_DISPLAY_RANGE = (0, 2.5)
+    # Which MR features to use as RF predictors: "day3" (only standardized names
+    # containing "Day 3"), "day0" (only "Day 0"), or "all" (every universal MR
+    # feature, Day 3 + Day 0 + Max Temp Proj mixed together).
+    MR_PREDICTOR_SET = "day3"
+    # Which regressor to run in every run_rf_cv call below: "rf" (RandomForestRegressor),
+    # "xgboost" (XGBRegressor), or "mlp" (MLPRegressor). See build_model() for the
+    # actual hyperparameters used per type.
+    MODEL_TYPE = "mlp"
 
-# Feature names to plot in the by-rabbit distribution violins (RUN_HNE/MR_FEATURE_
-# DISTRIBUTIONS below) — None means "every hne_names/mr_names feature".
-HNE_DISTRIBUTION_FEATURES = None
-MR_DISTRIBUTION_FEATURES = None
+    # Feature names to plot in the by-rabbit distribution violins (RUN_HNE/MR_FEATURE_
+    # DISTRIBUTIONS below) — None means "every hne_names/mr_names feature".
+    HNE_DISTRIBUTION_FEATURES = None
+    MR_DISTRIBUTION_FEATURES = None
 
-# --- Toggle which analyses run below (setup/shared values above each guarded ---
-# --- block always run, since later blocks may depend on them) ---
-RUN_PCA_BATCH_CHECK           = False
-RUN_UMAP_MR_HNE               = False
-RUN_HNE_FEATURE_DISTRIBUTIONS = False
-RUN_MR_FEATURE_DISTRIBUTIONS  = True
-RUN_SPATIAL_MAP               = False
-RUN_CROSS_CORR                = False
-RUN_RF_RABBIT_HOLDOUT         = True
-RUN_RF_SLIDE_HOLDOUT          = True
+    # --- Toggle which analyses run below (setup/shared values above each guarded ---
+    # --- block always run, since later blocks may depend on them) ---
+    RUN_PCA_BATCH_CHECK           = False
+    RUN_UMAP_MR_HNE               = False
+    RUN_HNE_FEATURE_DISTRIBUTIONS = False
+    RUN_MR_FEATURE_DISTRIBUTIONS  = True
+    RUN_SPATIAL_MAP               = False
+    RUN_CROSS_CORR                = False
+    RUN_RF_RABBIT_HOLDOUT         = True
+    RUN_RF_SLIDE_HOLDOUT          = True
 
-all_rabbits = []
-for rabbit_id, block_num in RABBIT_BLOCKS.items():
-    rabbit = load_rabbit(rabbit_id, block_num)
-    if rabbit is not None:
-        all_rabbits.append(rabbit)
-
-
-print("--- HnE feature standardization ---")
-feature_standardization({r.rabbit_id: list(r.hne_names) for r in all_rabbits})
-
-print("\n--- MR feature standardization (raw names) ---")
-feature_standardization({r.rabbit_id: list(r.mr_names) for r in all_rabbits})
-
-all_rabbits = standardize_mr(all_rabbits, Rename_Doc)
-
-print("\n--- MR feature standardization (standardized names) ---")
-feature_standardization({r.rabbit_id: list(r.mr_names) for r in all_rabbits})
-
-print("\n--- Sanitizing relaxation maps (impossible T1/T2 values -> NaN) ---")
-all_rabbits = sanitize_relaxation_maps(all_rabbits)
+    all_rabbits = []
+    for rabbit_id, block_num in RABBIT_BLOCKS.items():
+        rabbit = load_rabbit(rabbit_id, block_num)
+        if rabbit is not None:
+            all_rabbits.append(rabbit)
 
 
-# --- Examples: working with the loaded Rabbit/Slide namedtuples ---
+    print("--- HnE feature standardization ---")
+    feature_standardization({r.rabbit_id: list(r.hne_names) for r in all_rabbits})
 
-# Which rabbits loaded successfully
-print("Rabbits loaded:", [r.rabbit_id for r in all_rabbits])
+    print("\n--- MR feature standardization (raw names) ---")
+    feature_standardization({r.rabbit_id: list(r.mr_names) for r in all_rabbits})
 
-# Slide basenames and feature names for one rabbit
-first_rabbit = all_rabbits[0]
-print(f"Rabbit {first_rabbit.rabbit_id} slides:", [s.basename for s in first_rabbit.slides])
-print(f"Rabbit {first_rabbit.rabbit_id} hne_names:", first_rabbit.hne_names)
-print(f"Rabbit {first_rabbit.rabbit_id} mr_names:", first_rabbit.mr_names)
+    all_rabbits = standardize_mr(all_rabbits, Rename_Doc)
 
-# Loop over every rabbit and every slide
-for rabbit in all_rabbits:
-    print(f"\nRabbit {rabbit.rabbit_id}: {len(rabbit.slides)} slides, "
-          f"{len(rabbit.hne_names)} HnE features, {len(rabbit.mr_names)} MR features")
-    for slide in rabbit.slides:
-        print(f"  {slide.basename}: geometry shape {slide.geometry.shape}, "
-              f"hne_features shape {slide.hne_features.shape}, "
-              f"mr_features shape {slide.mr_features.shape}")
+    print("\n--- MR feature standardization (standardized names) ---")
+    feature_standardization({r.rabbit_id: list(r.mr_names) for r in all_rabbits})
 
-# --- Batch-effect check: do voxels separate by rabbit? PCA + silhouette score, ---
-# --- run separately for HnE and MR features so we can see which modality (if  ---
-# --- either) is driving any separation. Run first, before the other plots.    ---
-reference_hne_names = pooled_hne_names(all_rabbits)
+    print("\n--- Sanitizing relaxation maps (impossible T1/T2 values -> NaN) ---")
+    all_rabbits = sanitize_relaxation_maps(all_rabbits)
 
-if RUN_PCA_BATCH_CHECK:
-    pca_by_rabbit(all_rabbits, 'hne')
-    pca_by_rabbit(all_rabbits, 'mr')
 
-# --- UMAP of MR features, same 'mr' voxel population as the PCA batch check ---
-# --- above, fit once and colored two ways: by rabbit ID (batch-effect check) ---
-# --- and by HNE_FEATURE_OF_INTEREST (does MR structure track biology?).      ---
-if RUN_UMAP_MR_HNE:
-    umap_mr_by_rabbit_and_hne(all_rabbits, HNE_FEATURE_OF_INTEREST)
+    # --- Examples: working with the loaded Rabbit/Slide namedtuples ---
 
-# --- Feature distributions by rabbit: one violin per rabbit per feature ---
-if RUN_HNE_FEATURE_DISTRIBUTIONS:
-    hne_dist_features = HNE_DISTRIBUTION_FEATURES if HNE_DISTRIBUTION_FEATURES is not None else list(reference_hne_names)
-    plot_feature_distributions_by_rabbit(all_rabbits, hne_dist_features, 'hne')
+    # Which rabbits loaded successfully
+    print("Rabbits loaded:", [r.rabbit_id for r in all_rabbits])
 
-if RUN_MR_FEATURE_DISTRIBUTIONS:
-    mr_dist_features = MR_DISTRIBUTION_FEATURES if MR_DISTRIBUTION_FEATURES is not None else list(all_rabbits[0].mr_names)
-    plot_feature_distributions_by_rabbit(all_rabbits, mr_dist_features, 'mr')
+    # Slide basenames and feature names for one rabbit
+    first_rabbit = all_rabbits[0]
+    print(f"Rabbit {first_rabbit.rabbit_id} slides:", [s.basename for s in first_rabbit.slides])
+    print(f"Rabbit {first_rabbit.rabbit_id} hne_names:", first_rabbit.hne_names)
+    print(f"Rabbit {first_rabbit.rabbit_id} mr_names:", first_rabbit.mr_names)
 
-# --- Spatial map of a single HnE feature, every slide from every rabbit ---
-# One big grid across all rabbits, just to eyeball how standardized this feature
-# looks slide-to-slide/rabbit-to-rabbit before we design anything smarter.
-# Fixed color range (reused below for the RF fold-comparison plots too, so
-# Actual/Predicted panels share the same scale across every figure).
-target_value_range = pooled_hne_feature_range(all_rabbits, HNE_FEATURE_OF_INTEREST)
-if RUN_SPATIAL_MAP:
-    plot_hne_feature_spatial(all_rabbits, HNE_FEATURE_OF_INTEREST, vmin=target_value_range[0], vmax=target_value_range[1])
-
-if RUN_CROSS_CORR:
-    # --- Pooled correlation figure (per rabbit) ---
+    # Loop over every rabbit and every slide
     for rabbit in all_rabbits:
-        mr_pooled  = np.vstack([s.mr_features for s in rabbit.slides])
-        hne_pooled = np.vstack([s.hne_features for s in rabbit.slides])
+        print(f"\nRabbit {rabbit.rabbit_id}: {len(rabbit.slides)} slides, "
+              f"{len(rabbit.hne_names)} HnE features, {len(rabbit.mr_names)} MR features")
+        for slide in rabbit.slides:
+            print(f"  {slide.basename}: geometry shape {slide.geometry.shape}, "
+                  f"hne_features shape {slide.hne_features.shape}, "
+                  f"mr_features shape {slide.mr_features.shape}")
+
+    # --- Batch-effect check: do voxels separate by rabbit? PCA + silhouette score, ---
+    # --- run separately for HnE and MR features so we can see which modality (if  ---
+    # --- either) is driving any separation. Run first, before the other plots.    ---
+    reference_hne_names = pooled_hne_names(all_rabbits)
+
+    if RUN_PCA_BATCH_CHECK:
+        pca_by_rabbit(all_rabbits, 'hne')
+        pca_by_rabbit(all_rabbits, 'mr')
+
+    # --- UMAP of MR features, same 'mr' voxel population as the PCA batch check ---
+    # --- above, fit once and colored two ways: by rabbit ID (batch-effect check) ---
+    # --- and by HNE_FEATURE_OF_INTEREST (does MR structure track biology?).      ---
+    if RUN_UMAP_MR_HNE:
+        umap_mr_by_rabbit_and_hne(all_rabbits, HNE_FEATURE_OF_INTEREST)
+
+    # --- Feature distributions by rabbit: one violin per rabbit per feature ---
+    if RUN_HNE_FEATURE_DISTRIBUTIONS:
+        hne_dist_features = HNE_DISTRIBUTION_FEATURES if HNE_DISTRIBUTION_FEATURES is not None else list(reference_hne_names)
+        plot_feature_distributions_by_rabbit(all_rabbits, hne_dist_features, 'hne')
+
+    if RUN_MR_FEATURE_DISTRIBUTIONS:
+        mr_dist_features = MR_DISTRIBUTION_FEATURES if MR_DISTRIBUTION_FEATURES is not None else list(all_rabbits[0].mr_names)
+        plot_feature_distributions_by_rabbit(all_rabbits, mr_dist_features, 'mr')
+
+    # --- Spatial map of a single HnE feature, every slide from every rabbit ---
+    # One big grid across all rabbits, just to eyeball how standardized this feature
+    # looks slide-to-slide/rabbit-to-rabbit before we design anything smarter.
+    # Fixed color range (reused below for the RF fold-comparison plots too, so
+    # Actual/Predicted panels share the same scale across every figure).
+    target_value_range = pooled_hne_feature_range(all_rabbits, HNE_FEATURE_OF_INTEREST)
+    if RUN_SPATIAL_MAP:
+        plot_hne_feature_spatial(all_rabbits, HNE_FEATURE_OF_INTEREST, vmin=target_value_range[0], vmax=target_value_range[1])
+
+    if RUN_CROSS_CORR:
+        # --- Pooled correlation figure (per rabbit) ---
+        for rabbit in all_rabbits:
+            mr_pooled  = np.vstack([s.mr_features for s in rabbit.slides])
+            hne_pooled = np.vstack([s.hne_features for s in rabbit.slides])
+            cross_corr_pooled, _ = compute_cross_corr(mr_pooled, hne_pooled)
+
+            fig, ax = plt.subplots(figsize=(18, 5))
+            im = plot_corr(ax, cross_corr_pooled, rabbit.mr_names, rabbit.hne_names,
+                            f"Rabbit {rabbit.rabbit_id} — all slides pooled")
+            plt.colorbar(im, ax=ax, label='Spearman r')
+            plt.tight_layout()
+            plt.show()
+
+        # --- Pooled correlation figure (all rabbits) ---
+        # reference_hne_names already verified (order matches across all rabbits) above,
+        # by pooled_hne_names(), before the PCA batch-effect check.
+        mr_pooled  = np.vstack([s.mr_features for r in all_rabbits for s in r.slides])
+        hne_pooled = np.vstack([s.hne_features for r in all_rabbits for s in r.slides])
         cross_corr_pooled, _ = compute_cross_corr(mr_pooled, hne_pooled)
 
         fig, ax = plt.subplots(figsize=(18, 5))
-        im = plot_corr(ax, cross_corr_pooled, rabbit.mr_names, rabbit.hne_names,
-                        f"Rabbit {rabbit.rabbit_id} — all slides pooled")
+        im = plot_corr(ax, cross_corr_pooled, all_rabbits[0].mr_names, reference_hne_names,
+                        "All rabbits, all slides pooled")
         plt.colorbar(im, ax=ax, label='Spearman r')
         plt.tight_layout()
         plt.show()
 
-    # --- Pooled correlation figure (all rabbits) ---
-    # reference_hne_names already verified (order matches across all rabbits) above,
-    # by pooled_hne_names(), before the PCA batch-effect check.
-    mr_pooled  = np.vstack([s.mr_features for r in all_rabbits for s in r.slides])
-    hne_pooled = np.vstack([s.hne_features for r in all_rabbits for s in r.slides])
-    cross_corr_pooled, _ = compute_cross_corr(mr_pooled, hne_pooled)
 
-    fig, ax = plt.subplots(figsize=(18, 5))
-    im = plot_corr(ax, cross_corr_pooled, all_rabbits[0].mr_names, reference_hne_names,
-                    "All rabbits, all slides pooled")
-    plt.colorbar(im, ax=ax, label='Spearman r')
-    plt.tight_layout()
-    plt.show()
+    # --- Random forest regression (leave-one-rabbit-out, MR -> single HnE feature) ---
+    # Predictor columns come from mr_names (consistent order across rabbits, guaranteed
+    # by standardize_mr); direction is hardcoded MR -> HnE for now since that's what
+    # we're testing first. Swap to HnE -> MR later by passing hne_names as predictors
+    # and a list of mr_names as targets instead — run_rf_loocv itself is direction-
+    # agnostic (pool_rabbit_features just assumes predictor <- mr_features, target <- hne_features).
+    predictor_names = all_rabbits[0].mr_names
+    if MR_PREDICTOR_SET == "day3":
+        predictor_names = predictor_names[np.array(['Day 3' in n for n in predictor_names])]
+    elif MR_PREDICTOR_SET == "day0":
+        predictor_names = predictor_names[np.array(['Day 0' in n for n in predictor_names])]
+    elif MR_PREDICTOR_SET != "all":
+        raise ValueError(f"Unknown MR_PREDICTOR_SET: {MR_PREDICTOR_SET!r}, expected 'day3'/'day0'/'all'")
+    target_names = np.array([HNE_FEATURE_OF_INTEREST])
+    print(f"Model: {MODEL_TYPE!r}")
+    print(f"RF predictors (MR_PREDICTOR_SET={MR_PREDICTOR_SET!r}): {len(predictor_names)} MR features: {list(predictor_names)}")
+    if MODEL_TYPE not in MODELS_WITH_FEATURE_IMPORTANCE:
+        print(f"Note: {MODEL_TYPE!r} has no feature_importances_ — importance plots will be blank/NaN.")
 
+    # --- Leave-one-rabbit-out: cross-rabbit generalization ---
+    if RUN_RF_RABBIT_HOLDOUT:
+        r2_scores, mse_scores, importances, oof, geom, fold_labels, slide_ids = run_rf_cv(
+            rabbit_holdout_folds(all_rabbits, predictor_names, target_names), predictor_names, target_names,
+            value_range=target_value_range)
 
-# --- Random forest regression (leave-one-rabbit-out, MR -> single HnE feature) ---
-# Predictor columns come from mr_names (consistent order across rabbits, guaranteed
-# by standardize_mr); direction is hardcoded MR -> HnE for now since that's what
-# we're testing first. Swap to HnE -> MR later by passing hne_names as predictors
-# and a list of mr_names as targets instead — run_rf_loocv itself is direction-
-# agnostic (pool_rabbit_features just assumes predictor <- mr_features, target <- hne_features).
-predictor_names = all_rabbits[0].mr_names
-if MR_PREDICTOR_SET == "day3":
-    predictor_names = predictor_names[np.array(['Day 3' in n for n in predictor_names])]
-elif MR_PREDICTOR_SET == "day0":
-    predictor_names = predictor_names[np.array(['Day 0' in n for n in predictor_names])]
-elif MR_PREDICTOR_SET != "all":
-    raise ValueError(f"Unknown MR_PREDICTOR_SET: {MR_PREDICTOR_SET!r}, expected 'day3'/'day0'/'all'")
-target_names = np.array([HNE_FEATURE_OF_INTEREST])
-print(f"Model: {MODEL_TYPE!r}")
-print(f"RF predictors (MR_PREDICTOR_SET={MR_PREDICTOR_SET!r}): {len(predictor_names)} MR features: {list(predictor_names)}")
-if MODEL_TYPE not in MODELS_WITH_FEATURE_IMPORTANCE:
-    print(f"Note: {MODEL_TYPE!r} has no feature_importances_ — importance plots will be blank/NaN.")
+        plot_r2(r2_scores, target_names)
+        plot_mse(mse_scores, target_names)
+        print_cv_summary(r2_scores, mse_scores, fold_labels, target_names, geom)
+        plot_best_predicted_vs_actual(r2_scores, oof, target_names, fold_labels)
+        plot_spatial_accuracy(r2_scores, oof, geom, target_names, fold_labels)
+        plot_importances(importances, target_names, predictor_names)
+        plot_predicted_distributions_by_fold(oof, target_names, fold_labels, value_range=TARGET_DISPLAY_RANGE)
 
-# --- Leave-one-rabbit-out: cross-rabbit generalization ---
-if RUN_RF_RABBIT_HOLDOUT:
-    r2_scores, mse_scores, importances, oof, geom, fold_labels, slide_ids = run_rf_cv(
-        rabbit_holdout_folds(all_rabbits, predictor_names, target_names), predictor_names, target_names,
-        value_range=target_value_range)
+    # --- Leave-one-slide-out within each rabbit: baseline internal consistency, ---
+    # --- for comparison against the cross-rabbit result above. One representative ---
+    # --- fold (central slide, by natural-sorted position) gets the same           ---
+    # --- Actual/Predicted/%error figure as each rabbit's per-slide row in the     ---
+    # --- cross-rabbit run above — rather than that figure repeated for every      ---
+    # --- slide in the rabbit. Same fixed color range.                             ---
+    if RUN_RF_SLIDE_HOLDOUT:
+        loso_by_rabbit = {}
+        for rabbit in all_rabbits:
+            r2_scores_r, mse_scores_r, _, oof_r, geom_r, fold_labels_r, slide_ids_r = run_rf_cv(
+                slide_holdout_folds(rabbit, predictor_names, target_names), predictor_names, target_names,
+                plot_per_fold=False)
+            plot_r2(r2_scores_r, target_names, cv_label=f'leave-one-slide-out, Rabbit {rabbit.rabbit_id}')
+            plot_mse(mse_scores_r, target_names, cv_label=f'leave-one-slide-out, Rabbit {rabbit.rabbit_id}')
+            print_cv_summary(r2_scores_r, mse_scores_r, fold_labels_r, target_names, geom_r,
+                             cv_label=f'leave-one-slide-out, Rabbit {rabbit.rabbit_id}')
+            central_fold_i = len(fold_labels_r) // 2
+            representative_slide = fold_labels_r[central_fold_i]
+            plot_fold_comparison_by_slide(central_fold_i, oof_r, geom_r, slide_ids_r, target_names,
+                                          representative_slide, value_range=target_value_range)
 
-    plot_r2(r2_scores, target_names)
-    plot_mse(mse_scores, target_names)
-    print_cv_summary(r2_scores, mse_scores, fold_labels, target_names, geom)
-    plot_best_predicted_vs_actual(r2_scores, oof, target_names, fold_labels)
-    plot_spatial_accuracy(r2_scores, oof, geom, target_names, fold_labels)
-    plot_importances(importances, target_names, predictor_names)
-    plot_predicted_distributions_by_fold(oof, target_names, fold_labels, value_range=TARGET_DISPLAY_RANGE)
+            # Representative slide's own fold, kept alongside its already-computed
+            # R² -- reused below in plot_method_comparison_by_rabbit so LORO and
+            # LOSO get compared on identical voxels for this rabbit.
+            loso_by_rabbit[rabbit.rabbit_id] = (
+                representative_slide,
+                [oof_r[target_j][central_fold_i] for target_j in range(len(target_names))],
+                geom_r[central_fold_i],
+                [r2_scores_r[central_fold_i, target_j] for target_j in range(len(target_names))],
+            )
 
-# --- Leave-one-slide-out within each rabbit: baseline internal consistency, ---
-# --- for comparison against the cross-rabbit result above. One representative ---
-# --- fold (central slide, by natural-sorted position) gets the same           ---
-# --- Actual/Predicted/%error figure as each rabbit's per-slide row in the     ---
-# --- cross-rabbit run above — rather than that figure repeated for every      ---
-# --- slide in the rabbit. Same fixed color range.                             ---
-if RUN_RF_SLIDE_HOLDOUT:
-    loso_by_rabbit = {}
-    for rabbit in all_rabbits:
-        r2_scores_r, mse_scores_r, _, oof_r, geom_r, fold_labels_r, slide_ids_r = run_rf_cv(
-            slide_holdout_folds(rabbit, predictor_names, target_names), predictor_names, target_names,
-            plot_per_fold=False)
-        plot_r2(r2_scores_r, target_names, cv_label=f'leave-one-slide-out, Rabbit {rabbit.rabbit_id}')
-        plot_mse(mse_scores_r, target_names, cv_label=f'leave-one-slide-out, Rabbit {rabbit.rabbit_id}')
-        print_cv_summary(r2_scores_r, mse_scores_r, fold_labels_r, target_names, geom_r,
-                         cv_label=f'leave-one-slide-out, Rabbit {rabbit.rabbit_id}')
-        central_fold_i = len(fold_labels_r) // 2
-        representative_slide = fold_labels_r[central_fold_i]
-        plot_fold_comparison_by_slide(central_fold_i, oof_r, geom_r, slide_ids_r, target_names,
-                                      representative_slide, value_range=target_value_range)
-
-        # Representative slide's own fold, kept alongside its already-computed
-        # R² -- reused below in plot_method_comparison_by_rabbit so LORO and
-        # LOSO get compared on identical voxels for this rabbit.
-        loso_by_rabbit[rabbit.rabbit_id] = (
-            representative_slide,
-            [oof_r[target_j][central_fold_i] for target_j in range(len(target_names))],
-            geom_r[central_fold_i],
-            [r2_scores_r[central_fold_i, target_j] for target_j in range(len(target_names))],
-        )
-
-# --- Combined figure: Actual / Predicted(LORO) / %Error(LORO) / Predicted(LOSO) / ---
-# --- %Error(LOSO), one row per rabbit -- needs both blocks above to have run.     ---
-if RUN_RF_RABBIT_HOLDOUT and RUN_RF_SLIDE_HOLDOUT:
-    plot_method_comparison_by_rabbit(all_rabbits, target_names, oof, geom, slide_ids, loso_by_rabbit,
-                                     value_range=target_value_range)
+    # --- Combined figure: Actual / Predicted(LORO) / %Error(LORO) / Predicted(LOSO) / ---
+    # --- %Error(LOSO), one row per rabbit -- needs both blocks above to have run.     ---
+    if RUN_RF_RABBIT_HOLDOUT and RUN_RF_SLIDE_HOLDOUT:
+        plot_method_comparison_by_rabbit(all_rabbits, target_names, oof, geom, slide_ids, loso_by_rabbit,
+                                         value_range=target_value_range)
 

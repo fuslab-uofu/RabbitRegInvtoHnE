@@ -100,7 +100,8 @@ def CSV_CZI_lookup(rab_ID, block, file_numb, ceph_base='/System/Volumes/Data/cep
     BaseCephPath = os.path.join(ceph_base, 'animal_data/IACUC1800/')
     block_no = block.lower()
     # Path to CSV-
-    csv_dirpath = os.path.join(BaseCephPath, rab_ID, rab_ID + "_BlockFaceImages", block_no, "csv_files")
+    bf_candidates = glob.glob(os.path.join(BaseCephPath, rab_ID, rab_ID + "_Block*"))
+    csv_dirpath = os.path.join(bf_candidates[0], block_no, "csv_files")
     #Find last CSV from that directory->
     files = [f for f in os.listdir(csv_dirpath) if f.endswith('csv')]
     sorted_filenames = sorted(files, key=lambda x: float(re.findall(r'\d+', x)[0]))

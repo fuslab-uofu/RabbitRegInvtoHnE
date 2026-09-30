@@ -1,28 +1,23 @@
 #Import libraries-
 import os
+import re
 import SimpleITK as sitk
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # required for network filesystems (ceph, NFS)
 import numpy as np
 import nibabel as nib
 from ApplyTransforms import *
 from RabbitPathFinder import *
-from NiftyTransforms import makesegfromvol, match_histograms, bin_intensities, DimsDivFour
+from MaskAndHistMatch import mask_and_histmatch_block, resolve_cropped_path, DEFAULT_THRESH, DEFAULT_MASKTHRESH, DEFAULT_KERNSIZE
 from datetime import datetime
 import matplotlib.pyplot as plt
 import glob
 from PIL import Image
 
 def PrepForLandMarker(movingimpath, fixedimpath, SlicerTPath, output_dir,
-                      moving_stage, fixed_stage, Block=None, processing=None,
-                      fixed_output_dir=None, interpolator=sitk.sitkLinear):
+                      moving_stage, fixed_stage, Block=None, interpolator=sitk.sitkLinear):
     """
-    Part 1: Apply Slicer rigid transform, resample moving into fixed space,
+    Apply Slicer rigid transform, resample moving into fixed space,
     canonicalize, and save as .nii.gz ready for LandMarker.
-
-    processing='mask_and_histmatch': additionally computes a tissue mask from the
-    fixed volume, applies it to both volumes, and histogram-matches the resampled
-    moving to the masked fixed. Use for intensity-based registration stages
-    (e.g. ExVivo->ExVivoBlock).
     """
     warn_if_oblique(movingimpath)
     warn_if_oblique(fixedimpath)
@@ -43,45 +38,9 @@ def PrepForLandMarker(movingimpath, fixedimpath, SlicerTPath, output_dir,
 
     os.makedirs(output_dir, exist_ok=True)
 
-    if processing == 'mask_and_histmatch':
-        fixed_array = fixed_nib_canonical.get_fdata().astype(np.float32)
-
-        # Normalize both volumes to [0, 255] before masking and matching
-        resampled_norm = resampled / np.max(resampled) * 255 if np.max(resampled) > 0 else resampled
-        fixed_norm = fixed_array / np.max(fixed_array) * 255 if np.max(fixed_array) > 0 else fixed_array
-
-        mask = makesegfromvol(fixed_norm)
-
-        resampled_masked = resampled_norm * mask
-        fixed_masked = fixed_norm * mask
-
-        resampled_matched = match_histograms(resampled_masked, fixed_masked)
-
-        resampled_binned = bin_intensities(resampled_matched)
-        fixed_binned     = bin_intensities(fixed_masked)
-
-        fixed_dir = fixed_output_dir if fixed_output_dir is not None else output_dir
-        os.makedirs(fixed_dir, exist_ok=True)
-
-        resampled_out     = os.path.join(output_dir, f"{label(moving_stage)}ResampledTo{label(fixed_stage)}.nii.gz")
-        moving_out        = os.path.join(output_dir, f"{label(moving_stage)}MaskedTo{label(fixed_stage)}.nii.gz")
-        moving_binned_out = os.path.join(output_dir, f"{label(moving_stage)}MaskedTo{label(fixed_stage)}_binned.nii.gz")
-        fixed_out         = os.path.join(fixed_dir,  f"{label(fixed_stage)}Masked.nii.gz")
-        fixed_binned_out  = os.path.join(fixed_dir,  f"{label(fixed_stage)}Masked_binned.nii.gz")
-        nib.save(nib.Nifti1Image(resampled,                                          fixed_nib_canonical.affine), resampled_out)
-        nib.save(nib.Nifti1Image(DimsDivFour(resampled_matched).astype(np.float32), fixed_nib_canonical.affine), moving_out)
-        nib.save(nib.Nifti1Image(DimsDivFour(resampled_binned).astype(np.float32),  fixed_nib_canonical.affine), moving_binned_out)
-        nib.save(nib.Nifti1Image(DimsDivFour(fixed_masked).astype(np.float32),      fixed_nib_canonical.affine), fixed_out)
-        nib.save(nib.Nifti1Image(DimsDivFour(fixed_binned).astype(np.float32),      fixed_nib_canonical.affine), fixed_binned_out)
-        print(f"Saved resampled moving to {resampled_out}")
-        print(f"Saved masked+matched moving to {moving_out}")
-        print(f"Saved masked+matched+binned moving to {moving_binned_out}")
-        print(f"Saved masked fixed to {fixed_out}")
-        print(f"Saved masked+binned fixed to {fixed_binned_out}")
-    else:
-        output_path = os.path.join(output_dir, f"{label(moving_stage)}ResampledTo{label(fixed_stage)}.nii.gz")
-        nib.save(nib.Nifti1Image(resampled, fixed_nib_canonical.affine), output_path)
-        print(f"Saved to {output_path}")
+    output_path = os.path.join(output_dir, f"{label(moving_stage)}ResampledTo{label(fixed_stage)}.nii.gz")
+    nib.save(nib.Nifti1Image(resampled, fixed_nib_canonical.affine), output_path)
+    print(f"Saved to {output_path}")
 
     return resampled, fixed_nib_canonical.affine
 
@@ -129,35 +88,146 @@ def BlockFaceToNifti(blockface_folder):
     return output_path
 
 
-def MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder):
-    PROGRESSION = ["InVivo", "ExVivo", "ExVivoBlock", "BlockFace"]
-    for i in range(len(PROGRESSION) - 1):
-        moving_key = PROGRESSION[i]
-        fixed_key  = PROGRESSION[i + 1]
-        paths = find_all_the_paths(RabbitID, Block, RabbitFolder, moving_key)
+def PrepInVivoToExVivo(RabbitID, RabbitFolder, Block):
+    """
+    Run the InVivo->ExVivo resample once per rabbit. This stage's inputs and output
+    path don't depend on Block, so it only needs to run once no matter how many
+    blocks the rabbit has -- Block is only passed through to satisfy
+    find_all_the_paths()'s signature, it has no effect on this stage's paths.
+    Skips if the output already exists.
+    """
+    paths = find_all_the_paths(RabbitID, Block, RabbitFolder, "InVivo")
+    output_path = os.path.join(paths['RegDataProc'], "InVivoResampledToExVivo.nii.gz")
+    if os.path.exists(output_path):
+        print(f"{output_path} already exists, skipping InVivo->ExVivo resample.")
+        return
 
-        # For ExVivoBlock→BlockFace, ensure greyscale NIfTI exists before proceeding
-        if moving_key == "ExVivoBlock":
-            paths["Fixed_FilePath"] = BlockFaceToNifti(paths["Fixed_Folder"])
+    SlicerTPath = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
 
-        SlicerTPath = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
+    PrepForLandMarker(
+        movingimpath = paths['Moving_FilePath'],
+        fixedimpath  = paths['Fixed_FilePath'],
+        SlicerTPath  = SlicerTPath,
+        output_dir   = paths['RegDataProc'],
+        moving_stage = "InVivo",
+        fixed_stage  = "ExVivo",
+    )
 
-        PrepForLandMarker(
-            movingimpath     = paths['Moving_FilePath'],
-            fixedimpath      = paths['Fixed_FilePath'],
-            SlicerTPath      = SlicerTPath,
-            output_dir       = paths['RegDataProc'],
-            moving_stage     = moving_key,
-            fixed_stage      = fixed_key,
-            Block            = Block,
-            processing       = 'mask_and_histmatch' if moving_key == 'ExVivo' else None,
-            fixed_output_dir = os.path.join(paths['Fixed_Folder'], 'RegDataProc') if moving_key == 'ExVivo' else None,
+
+def PrepExVivoToExVivoBlock(RabbitID, Block, RabbitFolder, thresh, maskthresh, kernsize, interactive=True):
+    """
+    Run ExVivo->ExVivoBlock (resample, then interactive mask+histogram-match via
+    MaskAndHistMatch.mask_and_histmatch_block), for one block. Returns the
+    (possibly retuned) thresh, maskthresh, kernsize so the caller can carry them
+    forward as the starting point for the next block.
+
+    Devs haven't flushed this out as its own clean standalone stage yet -- this
+    is still just the ExVivo->ExVivoBlock leg lifted out of the combined
+    ExVivo->ExVivoBlock->BlockFace loop, not a redesigned stage.
+    """
+    moving_key, fixed_key = "ExVivo", "ExVivoBlock"
+    paths = find_all_the_paths(RabbitID, Block, RabbitFolder, moving_key)
+    SlicerTPath = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
+
+    PrepForLandMarker(
+        movingimpath = paths['Moving_FilePath'],
+        fixedimpath  = paths['Fixed_FilePath'],
+        SlicerTPath  = SlicerTPath,
+        output_dir   = paths['RegDataProc'],
+        moving_stage = moving_key,
+        fixed_stage  = fixed_key,
+        Block        = Block,
+    )
+
+    thresh, maskthresh, kernsize = mask_and_histmatch_block(
+        RabbitID, Block, RabbitFolder, thresh, maskthresh, kernsize, interactive=interactive
+    )
+    return thresh, maskthresh, kernsize
+
+
+def PrepExVivoBlockToBlockFace(RabbitID, Block, RabbitFolder):
+    """
+    Run ExVivoBlock->BlockFace (resample only, no landmark/mask step), for one
+    block at a time.
+    """
+    moving_key, fixed_key = "ExVivoBlock", "BlockFace"
+    paths = find_all_the_paths(RabbitID, Block, RabbitFolder, moving_key)
+    # Ensure greyscale NIfTI exists before proceeding
+    paths["Fixed_FilePath"] = BlockFaceToNifti(paths["Fixed_Folder"])
+
+    SlicerTPath = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
+
+    PrepForLandMarker(
+        movingimpath = paths['Moving_FilePath'],
+        fixedimpath  = paths['Fixed_FilePath'],
+        SlicerTPath  = SlicerTPath,
+        output_dir   = paths['RegDataProc'],
+        moving_stage = moving_key,
+        fixed_stage  = fixed_key,
+        Block        = Block,
+    )
+
+
+def discover_ready_blocks(RabbitID, RabbitFolder):
+    """Every BlockNN subfolder under this rabbit's ExVivo_MRBlocked/ directory that
+    has both prerequisites for a first ExVivo->ExVivoBlock run: the raw Cropped scan,
+    and a Slicer .h5 transform in ExVivo_MR/BlockNNReg/RegTransforms/. Skips (with a
+    message) any block missing either, rather than discovering a block this pipeline
+    can't actually process yet."""
+    blocked_dir = os.path.join(RabbitFolder, RabbitID, 'ExVivo_MRBlocked')
+    blocks = []
+    for entry in sorted(os.listdir(blocked_dir)):
+        m = re.fullmatch(r'Block(\d+)', entry)
+        if not m:
+            continue
+        block = int(m.group(1))
+        block_suffix = f"{block:02d}"
+        paths = find_all_the_paths(RabbitID, block, RabbitFolder, 'ExVivo')
+
+        cropped_path = resolve_cropped_path(paths['Fixed_Folder'])
+        slicer_path = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
+        if cropped_path is None:
+            print(f"  Skipping Block{block_suffix}: no Cropped scan found")
+            continue
+        if slicer_path is None:
+            print(f"  Skipping Block{block_suffix}: no Slicer .h5 transform found")
+            continue
+        blocks.append(block)
+    return blocks
+
+
+def RunRegistrationPipelineForRabbit(RabbitID, Blocks, RabbitFolder, interactive=True):
+    if not Blocks:
+        print(f"No ready blocks for {RabbitID}, nothing to do.")
+        return
+
+    PrepInVivoToExVivo(RabbitID, RabbitFolder, Blocks[0])
+
+    thresh, maskthresh, kernsize = DEFAULT_THRESH, DEFAULT_MASKTHRESH, DEFAULT_KERNSIZE
+    for Block in Blocks:
+        thresh, maskthresh, kernsize = PrepExVivoToExVivoBlock(
+            RabbitID, Block, RabbitFolder, thresh, maskthresh, kernsize, interactive=interactive
         )
+        PrepExVivoBlockToBlockFace(RabbitID, Block, RabbitFolder)
 
 
-#Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
+#Set which Rabbit we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R24-059"
-Block = 3
+RabbitID="R24-064"
+Block = 4  # only used by the two block-level stages below
 
-MultiStepPrepForLandMarker(RabbitID, Block, RabbitFolder)
+# --- Stage 1: InVivo -> ExVivo (once per rabbit, Block value doesn't matter) ---
+#PrepInVivoToExVivo(RabbitID, RabbitFolder, Block)
+
+# --- Stage 2: ExVivo -> ExVivoBlock ---
+# Devs haven't flushed that out yet as its own standalone stage.
+thresh, maskthresh, kernsize = DEFAULT_THRESH, DEFAULT_MASKTHRESH, DEFAULT_KERNSIZE
+thresh, maskthresh, kernsize = PrepExVivoToExVivoBlock(RabbitID, Block, RabbitFolder, thresh, maskthresh, kernsize)
+
+# --- Stage 3: ExVivoBlock -> BlockFace (one block at a time) ---
+#PrepExVivoBlockToBlockFace(RabbitID, Block, RabbitFolder)
+
+# --- Full batch run (all ready blocks, both remaining stages) -- uncomment to use instead of the above ---
+# Blocks = discover_ready_blocks(RabbitID, RabbitFolder)
+# print(f"Found {len(Blocks)} block(s) ready to process for {RabbitID}: {Blocks}")
+# RunRegistrationPipelineForRabbit(RabbitID, Blocks, RabbitFolder)

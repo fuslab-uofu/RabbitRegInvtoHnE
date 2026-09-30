@@ -4,3 +4,4 @@ SADMS/
 .idea/
 __pycache__/
 test_apply_transforms.py
+TestData/
