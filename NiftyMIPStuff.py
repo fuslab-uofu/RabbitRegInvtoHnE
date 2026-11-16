@@ -1,15 +1,17 @@
+import os
 import nibabel as nib
 import numpy as np
 import matplotlib.pyplot as plt
 import sys
 from PyQt5.QtGui import QPixmap, QMouseEvent, QImage, QColor
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                              QSlider, QLabel, QPushButton)
 from PyQt5.QtCore import Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from scipy.ndimage import affine_transform
-from skimage.filters import frangi
 import SimpleITK as sitk
+from frangi_vesselness import frangi_eigvals_by_sigma, frangi_vesselness_from_eigvals
 
 def maximum_intensity_projection(data, axis=2, slicesize=4):
     # 3. Perform the MIP using numpy.max() along the specified axis
@@ -39,16 +41,41 @@ def maximum_intensity_projection(data, axis=2, slicesize=4):
 
 
 class VolumeViewer(QMainWindow):
-    def __init__(self, data):
+    def __init__(self, eigvals_by_sigma, affine, gamma_init=4.0, alpha_init=0.5, beta_init=0.5,
+                 save_dir=os.path.expanduser('~/Desktop')):
+        """eigvals_by_sigma: precomputed per-sigma Hessian eigenvalues (see
+        frangi_vesselness.frangi_eigvals_by_sigma) -- the expensive
+        multi-scale 3D Hessian is computed ONCE by the caller, before this
+        viewer exists. alpha/beta/gamma are all live-tunable via slider
+        (recombining those cached eigenvalues is cheap regardless of which
+        of the three changes). affine: the source volume's nifti affine,
+        carried through unchanged so a saved vesselness map lines up with
+        everything else in Slicer."""
         super().__init__()
-        self.data = data
-        self.depth = data.shape[2]
+        self.eigvals_by_sigma = eigvals_by_sigma
+        self.affine = affine
+        self.save_dir = save_dir
+        self.gamma = gamma_init
+        self.alpha = alpha_init
+        self.beta = beta_init
         self.mipwindow=1
-        self.current_slice = self.depth // 2
         self.thresholding=0
         self.setMouseTracking(True)
+        self.recompute_vesselness()
+        self.depth = self.data.shape[2]
+        self.current_slice = self.depth // 2
         self.initUI()
         self.update_plot()
+
+    def recompute_vesselness(self):
+        """Cheap recombination of the cached per-sigma eigenvalues at the
+        current alpha/beta (no Hessian recomputation -- see
+        frangi_vesselness.py), rescaled to [0,255] to match this viewer's
+        existing threshold slider/imshow range convention."""
+        vesselness = frangi_vesselness_from_eigvals(self.eigvals_by_sigma, alpha=self.alpha,
+                                                     beta=self.beta, gamma=self.gamma)
+        vmax = vesselness.max()
+        self.data = vesselness / vmax * 255 if vmax > 0 else vesselness
 
     def initUI(self):
         self.setWindowTitle("3D Volume Slicer (PyQt5 + Matplotlib)")
@@ -106,6 +133,89 @@ class VolumeViewer(QMainWindow):
         slider_layout3.addWidget(self.slider3)
         main_layout.addLayout(slider_layout3)
 
+        # Alpha/beta as int sliders scaled by 100 (e.g. 50 -> 0.50) --
+        # QSlider only handles integers. Range 1-300 covers well past
+        # skimage's alpha=beta=0.5 default in either direction.
+        slider_layout4 = QHBoxLayout()
+        self.slider_label4 = QLabel(f"Alpha (plate sensitivity): {self.alpha:.2f}")
+        self.slider4 = QSlider(Qt.Horizontal)
+        self.slider4.setMinimum(1)
+        self.slider4.setMaximum(300)
+        self.slider4.setValue(round(self.alpha * 100))
+        self.slider4.setTickPosition(QSlider.TicksBelow)
+        self.slider4.valueChanged.connect(self.slider_value_changed4)
+        slider_layout4.addWidget(self.slider_label4)
+        slider_layout4.addWidget(self.slider4)
+        main_layout.addLayout(slider_layout4)
+
+        slider_layout5 = QHBoxLayout()
+        self.slider_label5 = QLabel(f"Beta (blob sensitivity): {self.beta:.2f}")
+        self.slider5 = QSlider(Qt.Horizontal)
+        self.slider5.setMinimum(1)
+        self.slider5.setMaximum(300)
+        self.slider5.setValue(round(self.beta * 100))
+        self.slider5.setTickPosition(QSlider.TicksBelow)
+        self.slider5.valueChanged.connect(self.slider_value_changed5)
+        slider_layout5.addWidget(self.slider_label5)
+        slider_layout5.addWidget(self.slider5)
+        main_layout.addLayout(slider_layout5)
+
+        # Gamma also scaled by 100, but a much wider range than alpha/beta --
+        # it's compared against the Hessian norm s, which (unlike Ra/Rb) isn't
+        # bounded to [0,1], so its meaningful scale is data-dependent. 1-2000
+        # -> 0.01-20.00 gives headroom in both directions around the
+        # already-tuned default of 4.0.
+        slider_layout6 = QHBoxLayout()
+        self.slider_label6 = QLabel(f"Gamma (structuredness sensitivity): {self.gamma:.2f}")
+        self.slider6 = QSlider(Qt.Horizontal)
+        self.slider6.setMinimum(1)
+        self.slider6.setMaximum(2000)
+        self.slider6.setValue(round(self.gamma * 100))
+        self.slider6.setTickPosition(QSlider.TicksBelow)
+        self.slider6.valueChanged.connect(self.slider_value_changed6)
+        slider_layout6.addWidget(self.slider_label6)
+        slider_layout6.addWidget(self.slider6)
+        main_layout.addLayout(slider_layout6)
+
+        self.save_button = QPushButton("Save vesselness (.nii.gz) to Desktop")
+        self.save_button.clicked.connect(self.save_vesselness)
+        main_layout.addWidget(self.save_button)
+        self.save_status = QLabel("")
+        main_layout.addWidget(self.save_status)
+
+    def save_vesselness(self):
+        """Saves the FULL 3D vesselness volume at the current alpha/beta
+        (self.data, already rescaled to [0,255] -- the same values being
+        displayed, not the thresholded/MIP'd 2D-per-slice self.datanew) as a
+        NIfTI, so it opens in Slicer aligned with everything else via the
+        source volume's own affine. Filename encodes alpha/beta/gamma so
+        multiple saved settings don't overwrite each other."""
+        os.makedirs(self.save_dir, exist_ok=True)
+        filename = f"vesselness_alpha{self.alpha:.2f}_beta{self.beta:.2f}_gamma{self.gamma:.1f}.nii.gz"
+        out_path = os.path.join(self.save_dir, filename)
+        nib.save(nib.Nifti1Image(self.data.astype(np.float32), affine=self.affine), out_path)
+        print(f"Saved vesselness (alpha={self.alpha:.2f}, beta={self.beta:.2f}, "
+              f"gamma={self.gamma:.1f}) -> {out_path}")
+        self.save_status.setText(f"Saved -> {out_path}")
+
+    def slider_value_changed4(self, value4):
+        self.alpha = value4 / 100
+        self.recompute_vesselness()
+        self.update_plot()
+        self.slider_label4.setText(f"Alpha (plate sensitivity): {self.alpha:.2f}")
+
+    def slider_value_changed5(self, value5):
+        self.beta = value5 / 100
+        self.recompute_vesselness()
+        self.update_plot()
+        self.slider_label5.setText(f"Beta (blob sensitivity): {self.beta:.2f}")
+
+    def slider_value_changed6(self, value6):
+        self.gamma = value6 / 100
+        self.recompute_vesselness()
+        self.update_plot()
+        self.slider_label6.setText(f"Gamma (structuredness sensitivity): {self.gamma:.2f}")
+
     def slider_value_changed3(self, value3):
         self.mipwindow = value3
         self.update_plot()
@@ -128,9 +238,19 @@ class VolumeViewer(QMainWindow):
         self.datanew=maximum_intensity_projection(self.datanew, axis=2, slicesize=self.mipwindow)
         self.depth = self.datanew.shape[2]
         self.ax.clear()
-        # Display the 2D slice using imshow
-        self.ax.imshow(self.datanew[:,:,self.current_slice], vmin=0,vmax=255,cmap='gray', origin='lower')
-        self.ax.set_title(f"Z-Slice {self.current_slice}")
+        # Display the 2D slice using imshow -- vmax is the CURRENT slice's own
+        # max, not a fixed 255, so contrast always auto-stretches to whatever
+        # this view actually contains. Otherwise self.data's global rescale
+        # (brightest voxel in the WHOLE volume -> 255) says nothing about
+        # whether this particular slice is well-represented in that range, so
+        # a genuinely uneven alpha/beta effect across slices reads as "the
+        # whole image got dimmer" instead of "this slice has less signal now" --
+        # exactly the confound in comparing alpha/beta settings by eye.
+        slice_img = self.datanew[:, :, self.current_slice]
+        slice_vmax = slice_img.max()
+        self.ax.imshow(slice_img, vmin=0, vmax=slice_vmax if slice_vmax > 0 else 1,
+                        cmap='gray', origin='lower')
+        self.ax.set_title(f"Z-Slice {self.current_slice} (displayed vmax={slice_vmax:.1f})")
         self.ax.set_xlabel("X-axis")
         self.ax.set_ylabel("Y-axis")
         # Redraw the canvas to reflect changes
@@ -179,7 +299,7 @@ def FlattenBack(Varray, Myrange):
 def main():
     # 1. Generate sample 3D data (e.g., a simple gradient volume)
     # Load in Nifti from path-
-    nifti_path = '/Users/jbonaventura/Downloads/R23-055/InVivo_MR/48 3D_VIBE_0.5x0.5x1_cor_postContrast.nii'
+    nifti_path = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData/R24-240/InVivo_MR/61 3D_VIBE_0.5mmIso_cor_CE.nii'
     img = nib.load(nifti_path)
     affine_transform=img.affine
     nifti_array = img.get_fdata()
@@ -218,11 +338,10 @@ def main():
 
 
 
-    # vesselness = frangi(nifti_array, sigmas=range(1, 8), black_ridges=False, gamma=4)
-    # print(nifti_array.shape, vesselness.shape, np.max(vesselness), np.min(vesselness))
-    # #Normalize-
-    # vesselness=vesselness/np.max(vesselness)*100
-    # vesselness=np.where(vesselness<5,0,vesselness)
+    # Expensive step (multi-scale 3D Hessian), done once; alpha/beta are then
+    # slider-live in VolumeViewer via the cheap recombination step -- see
+    # frangi_vesselness.py. gamma stays fixed at the already-tuned value.
+    eigvals_by_sigma = frangi_eigvals_by_sigma(nifti_array, sigmas=range(2, 8), black_ridges=False)
 
    #  print(f"vesselness_norm min: {vesselness_norm.min():.4f}")
    #  print(f"vesselness_norm max: {vesselness_norm.max():.4f}")
@@ -323,7 +442,7 @@ def main():
 
  #   2. Run the PyQt5 application
     app = QApplication(sys.argv)
-    viewer = VolumeViewer(nifti_post_thresh)
+    viewer = VolumeViewer(eigvals_by_sigma, affine_transform, gamma_init=4.0)
     viewer.show()
     sys.exit(app.exec_())
 

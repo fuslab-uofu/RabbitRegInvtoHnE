@@ -21,3 +21,6 @@ shapely==2.1.2
 pylibCZIrw==6.1.0
 pyvips==3.1.1
 torchstain==1.4.1
+xgboost==3.3.0
+umap-learn==0.5.12
+pyradiomics @ git+https://github.com/AIM-Harvard/pyradiomics.git@8ed579383b44806651c463d5e691f3b2b57522ab

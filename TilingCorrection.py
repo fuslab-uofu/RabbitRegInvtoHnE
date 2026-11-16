@@ -1,9 +1,12 @@
 #Import Desired Libraries
 import os
 import re
-import ctypes
-os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")  # macOS Homebrew arm64 lib dir
-ctypes.CDLL("/working/ProgCaches/CondaCaches/conda-envs/libvips-env/lib/libvips.so.42", mode=ctypes.RTLD_GLOBAL)
+import sys
+if sys.platform == 'darwin':
+    os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")  # macOS Homebrew arm64 lib dir
+elif sys.platform == 'linux':
+    import ctypes
+    ctypes.CDLL("/working/ProgCaches/CondaCaches/conda-envs/libvips-env/lib/libvips.so.42", mode=ctypes.RTLD_GLOBAL)
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,7 +19,7 @@ from pylibCZIrw import czi as cziwriter
 
 from TileUtils import make_tissue_mask, swap_channel_order, CSV_CZI_lookup
 
-CEPH_BASE = "/ceph/hifu"
+CEPH_BASE = next(p for p in ("/System/Volumes/Data/ceph/hifu", "/ceph/hifu") if os.path.isdir(p))
 
 Ref_path = os.path.join(CEPH_BASE, "users/jbonaventura/RabbitRegistrationProj/RefMaterials/HnE_R23-055_H7_7a_StainNormRef.tif")
 
@@ -26,10 +29,9 @@ Ref_path = os.path.join(CEPH_BASE, "users/jbonaventura/RabbitRegistrationProj/Re
 # same convention TilesToVoxels.py already uses), so un-registered edge slices are
 # skipped automatically without needing to list them separately.
 RABBIT_BLOCKS = [
-    ("R24-082", 5),
-    ("R24-240", 3),
-    ("R24-103", 6),
-    ("R23-055", 7),
+    ("R23-292", 4),
+    # ("R24-058", 6),
+    # ("R24-240", 3),
 ]
 
 def registered_czi_paths(rabbit_id, block_no, ceph_base=CEPH_BASE):
@@ -610,6 +612,16 @@ def read_corrected_czi(output_path, page=0):
 
 #Establish a tiling intensity profile
 for rabbit_id, block_no, path in test_slides:
+    # rabbit_block_output_dir creates NormalizedFull via os.makedirs(exist_ok=True), so this
+    # is safe to call even the first time for a block, before that folder exists yet.
+    output_dir = rabbit_block_output_dir(rabbit_id, block_no)
+    output_tiff_path = os.path.join(output_dir,
+                                     os.path.splitext(os.path.basename(path))[0] + "_corrected_fullres.tif")
+    if os.path.exists(output_tiff_path):
+        print(f"SKIPPING {os.path.basename(path)} (rabbit {rabbit_id}, block {block_no}): "
+              f"already normalized at {output_tiff_path}")
+        continue
+
     img, mask, background_tiles, tissue_tiles, dark_anomaly_tiles = find_background_tiles(path)
     if not background_tiles:
         print(f"SKIPPING {os.path.basename(path)} (rabbit {rabbit_id}, block {block_no}): "
@@ -645,9 +657,6 @@ for rabbit_id, block_no, path in test_slides:
         plt.title(os.path.basename(path) + " (reconstructed, corrected, tile-by-tile placement)")
         plt.show()
 
-    output_dir = rabbit_block_output_dir(rabbit_id, block_no)
-    output_tiff_path = os.path.join(output_dir,
-                                     os.path.splitext(os.path.basename(path))[0] + "_corrected_fullres.tif")
     result_path = write_corrected_czi(path, coeffs_per_channel, output_tiff_path, scale_factor=1)
     if result_path is None:
         continue

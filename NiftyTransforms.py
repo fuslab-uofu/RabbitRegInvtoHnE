@@ -37,10 +37,21 @@ def match_histograms(source, template):
     return matched
 
 def bin_intensities(vol, n_bins=8):
-    """Quantize intensities into n_bins equal-width steps over [0, 255].
-    Zero voxels (background) remain zero regardless of bin boundaries."""
-    stepsize = 255 // n_bins
-    binned = (np.floor(vol / stepsize) * stepsize).astype(np.float32)
+    """Quantize intensities into n_bins equal-width steps spanning this volume's own
+    non-zero [min, max] range (not a fixed [0, 255] scale), so the number of
+    populated bins stays consistent regardless of how much dynamic range survived
+    masking/histogram-matching. Zero voxels (background) remain zero regardless of
+    bin boundaries."""
+    nonzero = vol[vol != 0]
+    if nonzero.size == 0:
+        return np.zeros_like(vol, dtype=np.float32)
+    vmin, vmax = nonzero.min(), nonzero.max()
+    stepsize = (vmax - vmin) / n_bins
+    if stepsize == 0:
+        binned = np.full_like(vol, vmin, dtype=np.float32)
+    else:
+        bin_idx = np.clip(np.floor((vol - vmin) / stepsize), 0, n_bins - 1)
+        binned = (bin_idx * stepsize + vmin).astype(np.float32)
     binned[vol == 0] = 0
     return binned
 
@@ -187,8 +198,26 @@ def FlattenBack(Varray, Myrange):
 
 
 
+def resolve_threshold_field(value, shape):
+    """Resolve a thresh/maskthresh spec to a scalar or a per-voxel field matching
+    `shape`. `value` is a plain number, or a string formula in x, y, z (the voxel
+    index along array axes 0, 1, 2) for a directional threshold that compensates for
+    a coil-inhomogeneity gradient, e.g. '10+4x'. Only x, y, z, and np are available
+    in formulas."""
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return value
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    x, y, z = np.indices(shape)
+    return eval(value, {'__builtins__': {}}, {'x': x, 'y': y, 'z': z, 'np': np})
+
+
 def makesegfromvol(vol_array, thresh=70, maskthresh=160, kernsize=10):
-    mask = TakeOutBack(vol_array, thresh, maskthresh, kernsize)
+    thresh_field = resolve_threshold_field(thresh, vol_array.shape)
+    maskthresh_field = resolve_threshold_field(maskthresh, vol_array.shape)
+    mask = TakeOutBack(vol_array, thresh_field, maskthresh_field, kernsize)
 
     # Keep only the largest connected component — removes edge artifacts and noise
     labeled, n_components = ndimage_label(mask)

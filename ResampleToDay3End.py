@@ -9,7 +9,6 @@ Two transform chains:
 
 The Day3_end → Day0 combined displacement field is cached as a .npy so it only
 needs to be computed once per rabbit.
-
 Per-rabbit Day3 filenames are read from {DAY3_DIR}/{RABBIT_ID_underscored}_InVDay3Log.csv.
 CSV columns: 'File Name' (no extension), 'Home' (Fixed | End | Start).
 """
@@ -20,26 +19,26 @@ import shutil
 import tempfile
 import numpy as np
 import nibabel as nib
+from nibabel.processing import resample_from_to
 import SimpleITK as sitk
 from scipy.ndimage import map_coordinates
 import csv
 import cv2
 import matplotlib.pyplot as plt
 from ApplyTransforms import ApplySlicerTransform, propagate_tiles_to_day0
+from RabbitPathFinder import find_nii
 
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 
 # ---------------------------------------------------------------------------
-# Paths — edit these two lines per rabbit
+# Paths
 # ---------------------------------------------------------------------------
-RABBIT_FOLDER = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RABBIT_ID     = 'R24-240'
+RABBIT_FOLDER     = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
+READY_RABBITS_CSV = os.path.join(os.path.dirname(RABBIT_FOLDER), 'ReadyRabbits.csv')
 
-_base     = os.path.join(RABBIT_FOLDER, RABBIT_ID, 'InVivo_MR', 'InVMRDataSets')
-DAY3_DIR  = os.path.join(_base, 'Day3')
-DAY0_DIR  = os.path.join(_base, 'Day0')
-XFMS_DIR  = os.path.join(_base, 'Transforms')
-OUT_DIR   = os.path.join(_base, 'Day3End_Registered')
+# Per-rabbit paths (_base, DAY3_DIR, DAY0_DIR, XFMS_DIR, OUT_DIR, and everything
+# derived from them below) are set as globals inside run_for_rabbit() so the
+# batch loop at the bottom of the file can re-point them at each rabbit in turn.
 
 # ---------------------------------------------------------------------------
 # Load Day3 filenames from log CSV
@@ -57,13 +56,11 @@ def _load_day3_log(day3_dir, rabbit_id):
             roles.setdefault(key, []).append(val)
     return roles
 
-_fwd_matches      = glob.glob(os.path.join(DAY3_DIR, '*.h5'))
-SLICER_FWD_PATH   = _fwd_matches[0] if _fwd_matches else None
-SLICER_INV_CACHE  = os.path.join(DAY3_DIR, 'Day3_end_to_start_inv_cached.h5')
-AFFINE_FIELD_PATH = os.path.join(XFMS_DIR, 'Affine_deformation.npy')
-SPLINES_FIELD_PATH= os.path.join(XFMS_DIR, 'SplinesProjection.npy')
-SDIFF_FIELD_PATH  = os.path.join(XFMS_DIR, 'sdiff.npy')
-DISPLACEMENT_CACHE= os.path.join(OUT_DIR, 'day3end_to_day0_voxel_coords.npy')
+
+def _load_rabbit_ids(csv_path):
+    """Load the batch rabbit-ID list from ReadyRabbits.csv ('rabbit' column)."""
+    with open(csv_path, newline='') as f:
+        return [row['rabbit'].strip() for row in csv.DictReader(f)]
 
 # Increase if Day0→Day3_end still looks warped in large-deformation regions.
 # Delete the cached .npy and re-run after changing this.
@@ -84,10 +81,36 @@ INTERP_ORDER = 1
 # Set RETUNE_MASK=True to interactively tune parameters before each run.
 # Set RETUNE_MASK=False to use the values below directly (no prompts).
 APPLY_MASK      = True
-RETUNE_MASK     = True
+RETUNE_MASK     = False
 MASK_THRESH     = 10
 MASK_MASKTHRESH = 150
 MASK_KERNSIZE   = 15
+
+# Set RUN_DAY0=False to skip the Day3_end -> Day0 displacement field and Day0
+# resampling entirely -- only the Day3_end structural + Day3_start extras
+# (T1/T2 maps etc.) get built.
+RUN_DAY0        = False
+
+# T1/T2 map coronal-slice artifact masking (applied to the native volume,
+# before any resampling/transform). Some acquisitions have one or more whole
+# corrupted coronal slices (extreme bright or negative garbage values across
+# nearly the entire slice) -- confirmed present on multiple rabbits at
+# different slice indices each time, unlike a fixed-position issue. Set
+# MASK_TMAP_ARTIFACTS=False to skip this and resample T1/T2 raw.
+MASK_TMAP_ARTIFACTS = True
+TMAP_Z_THRESH       = 15  # robust (median/MAD) |z|-score cutoff on a coronal
+                          # slice's median intensity -- real tissue variation
+                          # seen so far tops out around |z|~12, confirmed
+                          # artifacts run |z|~50-18000, so 15 cleanly separates
+                          # the two with margin on both sides.
+
+# T1 maps specifically (T2 maps look fine) also have widespread, milder
+# slab-edge artifacts -- degraded fits on the first/last slice of the
+# tissue-containing range -- too mild and inconsistent (sometimes a
+# near-zero clamp, sometimes an elevated-but-still-varying plane) to
+# reliably clear TMAP_Z_THRESH. Rather than chase that with a lower
+# threshold, unconditionally zero the outermost tissue-bearing slice on
+# each end for T1 maps, after the coronal-slice masking above.
 
 # ---------------------------------------------------------------------------
 # Normalization config
@@ -99,6 +122,18 @@ SAVE_NORMALIZED = True
 NORM_METHOD     = 'percentile'  # 'percentile' | 'minmax' | 'zscore'
 NORM_CLIP_PCT   = 1.0
 NORM_OUT_RANGE  = (0.0, 1.0)
+
+# Set SAVE_NORMALIZED_METHOD2=True to also save a copy into Normalized_method2/:
+#   T1/T2 maps     -> fixed physical scale (ms / QUANT_MAP_SCALE), clipped to [0, 1]
+#   other contrasts -> ratio to the rabbit's healthy-muscle median, so healthy
+#                      muscle = 1 and background stays 0 (downstream treats 0 as
+#                      outside body/FOV). Dividing removes per-rabbit receiver
+#                      gain / coil-sensitivity scaling.
+# Healthy-muscle mask: hand-drawn in Slicer, one per rabbit, at
+# InVMRDataSets/HEALTHY_MUSCLE_MASK_NAME (any grid; resampled by affine).
+SAVE_NORMALIZED_METHOD2  = True
+QUANT_MAP_SCALE          = {'t1map': 3000.0, 't2map': 200.0}
+HEALTHY_MUSCLE_MASK_NAME = 'Healthy_Muscle_Annotation.nii.gz'
 
 
 # ---------------------------------------------------------------------------
@@ -116,19 +151,22 @@ def _load_transform(path):
         os.unlink(tmp_path)
 
 
-def _apply_slicer_inv_vectorized(pts_ras, inv_composite):
+def _apply_slicer_transform_vectorized(pts_ras, slicer_transform):
     """
-    Apply the cached Slicer inverse composite (Day3_end → Day3_start) to an
-    (N, 3) array of physical RAS points, fully vectorized via map_coordinates.
+    Apply the Slicer Day3_start_to_end.h5 transform to an (N, 3) array of
+    physical RAS points, fully vectorized via map_coordinates. Per ITK's
+    fixed->moving pull convention (registered Day3_start (moving) -> Day3_end
+    (fixed)), applying this transform to a Day3_end point pulls the
+    corresponding Day3_start point -- no separate inversion step needed.
 
-    The composite applies inv_disp first, then inv_affine (both in LPS).
+    The transform applies its displacement field first, then its affine (both in LPS).
     Returns (N, 3) physical RAS points in Day3_start space.
     """
     pts_lps = pts_ras * np.array([-1., -1., 1.])
 
-    # --- inv_disp (DisplacementFieldTransform) ---
-    inv_disp_t = sitk.DisplacementFieldTransform(inv_composite.GetNthTransform(0))
-    disp_img   = inv_disp_t.GetDisplacementField()
+    # --- displacement field (DisplacementFieldTransform) ---
+    disp_t     = sitk.DisplacementFieldTransform(slicer_transform.GetNthTransform(0))
+    disp_img   = disp_t.GetDisplacementField()
     disp_arr   = sitk.GetArrayFromImage(disp_img)  # (Z, Y, X, 3) LPS displacements
 
     origin    = np.array(disp_img.GetOrigin())              # LPS (X, Y, Z)
@@ -148,12 +186,12 @@ def _apply_slicer_inv_vectorized(pts_ras, inv_composite):
 
     pts_lps = pts_lps + displacements
 
-    # --- inv_affine (AffineTransform) ---
-    inv_aff    = inv_composite.GetNthTransform(1)
-    params     = np.array(inv_aff.GetParameters())
+    # --- affine (AffineTransform) ---
+    aff        = slicer_transform.GetNthTransform(1)
+    params     = np.array(aff.GetParameters())
     M          = params[:9].reshape(3, 3)
     t          = params[9:]
-    c          = np.array(inv_aff.GetFixedParameters()[:3])
+    c          = np.array(aff.GetFixedParameters()[:3])
 
     pts_lps = (pts_lps - c) @ M.T + c + t
 
@@ -310,18 +348,98 @@ def tune_mask_interactively(vol_arr, thresh, maskthresh, kernsize):
         kernsize = int(val) if val else kernsize
 
 
+def is_t_map(path):
+    stem = os.path.basename(path).lower()
+    return 't1map' in stem or 't2map' in stem
+
+
+def flag_bad_coronal_slices(arr, z_thresh=TMAP_Z_THRESH):
+    """Two-sided robust-outlier test on each coronal slice's (axis 2) median
+    intensity, using only finite nonzero voxels -- flags whole corrupted
+    slices (either abnormally bright or abnormally dark/negative), not just
+    background. Returns (bad, z): bad is a (Z,) bool array, z the per-slice
+    robust z-score (median/MAD) for inspection."""
+    finite_nonzero = np.isfinite(arr) & (arr != 0)
+    n = arr.shape[2]
+    slice_med = np.full(n, np.nan)
+    for k in range(n):
+        vals = arr[:, :, k][finite_nonzero[:, :, k]]
+        if vals.size > 20:
+            slice_med[k] = np.median(vals)
+
+    valid = np.isfinite(slice_med)
+    med = np.median(slice_med[valid])
+    mad = np.median(np.abs(slice_med[valid] - med)) + 1e-9
+    z = np.full(n, np.nan)
+    z[valid] = (slice_med[valid] - med) / (1.4826 * mad)
+
+    bad = np.zeros(n, dtype=bool)
+    bad[valid] = np.abs(z[valid]) > z_thresh
+    return bad, z
+
+
+def mask_bad_coronal_slices(path, z_thresh=TMAP_Z_THRESH, out_dir=None):
+    """Loads a T1/T2 map, zeros out any coronal slice flagged as a corrupted
+    outlier plane, and saves a copy for downstream resampling to use in
+    place of the raw file. Returns the new path, or the original path
+    unchanged if nothing was flagged."""
+    img = nib.load(path)
+    arr = img.get_fdata(dtype=np.float32)
+    bad, z = flag_bad_coronal_slices(arr, z_thresh)
+    if not bad.any():
+        return path
+
+    flagged = np.where(bad)[0]
+    print(f"  [{os.path.basename(path)}] masking {bad.sum()} corrupted coronal "
+          f"slice(s): {list(flagged)} (z={[f'{z[i]:.0f}' for i in flagged]})")
+    arr[:, :, bad] = 0.0
+
+    stem = os.path.basename(path).replace('.nii.gz', '')
+    out_dir = out_dir or tempfile.gettempdir()
+    out_path = os.path.join(out_dir, f'{stem}_slicemasked.nii.gz')
+    nib.save(nib.Nifti1Image(arr, img.affine, img.header), out_path)
+    return out_path
+
+
+def is_t1_map(path):
+    return 't1map' in os.path.basename(path).lower()
+
+
+def zero_edge_tissue_planes(path, out_dir=None):
+    """Zero the first and last coronal (axis 2) slice containing any nonzero
+    voxels. T1 map slab-edge slices have degraded fits too mild/inconsistent
+    to reliably clear flag_bad_coronal_slices' outlier threshold, so these
+    are stripped unconditionally instead of via the z-score test."""
+    img = nib.load(path)
+    arr = img.get_fdata(dtype=np.float32)
+    tissue_slices = np.where(np.any(arr != 0, axis=(0, 1)))[0]
+    if tissue_slices.size < 3:
+        return path
+
+    first, last = tissue_slices[0], tissue_slices[-1]
+    print(f"  [{os.path.basename(path)}] zeroing edge coronal slices {first} and {last}")
+    arr[:, :, first] = 0.0
+    arr[:, :, last] = 0.0
+
+    stem = os.path.basename(path).replace('.nii.gz', '')
+    out_dir = out_dir or tempfile.gettempdir()
+    out_path = os.path.join(out_dir, f'{stem}_edgezeroed.nii.gz')
+    nib.save(nib.Nifti1Image(arr, img.affine, img.header), out_path)
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Core: build dense Day3_end → Day0 displacement field
 # ---------------------------------------------------------------------------
 
-def build_day3end_to_day0_field(day3_end_nib, day3_start_nib, inv_composite,
+def build_day3end_to_day0_field(day3_end_nib, day3_start_nib, slicer_transform,
                                  affine_field, splines_field, sdiff_field,
                                  n_iter=N_ITER, alpha=ALPHA):
     """
     For every voxel in Day3_end space compute the corresponding 0-indexed Day0
     voxel coordinate via:
         Day3_end voxel → physical RAS
-        → [Slicer inv] → Day3_start physical RAS
+        → [Slicer transform] → Day3_start physical RAS
         → Day3_start voxel
         → [F^{-1}]    → Day0 voxel
 
@@ -340,17 +458,28 @@ def build_day3end_to_day0_field(day3_end_nib, day3_start_nib, inv_composite,
     phys_ras = (day3_end_nib.affine @ hom.T).T[:, :3].astype(np.float32)
     del hom
 
-    # Physical RAS → Day3_start physical RAS (Slicer inverse, vectorized)
-    print("  Applying Slicer inverse transform...")
-    day3start_ras = _apply_slicer_inv_vectorized(phys_ras, inv_composite).astype(np.float32)
+    # Physical RAS → Day3_start physical RAS (Slicer transform, vectorized)
+    print("  Applying Slicer transform...")
+    day3start_ras = _apply_slicer_transform_vectorized(phys_ras, slicer_transform).astype(np.float32)
     del phys_ras
 
     # Physical RAS → APS voxel (0-indexed).
-    # The APS fields live in Day3_end/Day0 orientation (384, 144, 512).
-    # Day3_start NIfTI has Y and Z swapped (384, 512, 144), so using its affine
-    # here would put coordinates into the wrong axis ordering for the APS fields.
+    # The APS fields' domain is whatever raw on-disk orientation the Day0
+    # volumes are stored in (loaded with no reorientation below) — NOT
+    # nibabel's canonical RAS+. Reorient Day3_start to match Day0's native
+    # orientation (rather than forcing RAS+) to get an affine usable for this
+    # lookup, since Day3_start/Day3_end on-disk orientation varies per rabbit
+    # and can't be trusted directly. Verified to reproduce the known-good
+    # affine exactly on rabbits where a native APS-oriented Day3 volume also
+    # exists for comparison.
+    day0_ref_nib = nib.load(sorted(glob.glob(os.path.join(DAY0_DIR, 'Masked', '*.nii.gz')))[0])
+    ornt_xfm     = nib.orientations.ornt_transform(
+        nib.io_orientation(day3_end_nib.affine),
+        nib.io_orientation(day0_ref_nib.affine),
+    )
+    aps_affine     = day3_end_nib.as_reoriented(ornt_xfm).affine
     hom            = np.column_stack([day3start_ras, np.ones(N, dtype=np.float32)])
-    day3start_vox  = (np.linalg.inv(day3_end_nib.affine) @ hom.T).T[:, :3].astype(np.float32)
+    day3start_vox  = (np.linalg.inv(aps_affine) @ hom.T).T[:, :3].astype(np.float32)
     del day3start_ras, hom
 
     if APS_INV_METHOD == 'sitk':
@@ -414,8 +543,39 @@ def normalize_mr_array(arr, norm='percentile', clip_pct=1.0, out_range=(0.0, 1.0
     return a
 
 
-def save_registered(arr, stem, day3_end_nib, out_dir, norm_out_dir=None):
-    """Save the raw registered array, plus an optional normalized copy in norm_out_dir."""
+def load_healthy_muscle_mask(mask_path, day3_end_nib):
+    """Load the healthy-muscle label volume as a bool mask on the Day3_end grid.
+    Masks exported on a cropped grid are resampled (nearest neighbour, by affine)."""
+    mask_nib = nib.load(mask_path)
+    if mask_nib.shape != day3_end_nib.shape or not np.allclose(mask_nib.affine, day3_end_nib.affine):
+        mask_nib = resample_from_to(mask_nib, day3_end_nib, order=0)
+    mask = np.asarray(mask_nib.dataobj) > 0
+    print(f'  Healthy-muscle mask: {mask.sum():,} voxels ({mask_path})')
+    return mask
+
+
+def normalize_method2(arr, stem, muscle_mask):
+    """T1/T2 maps: divide by a fixed physical scale and clip to [0, 1].
+    Other contrasts: divide by the healthy-muscle median (nonzero voxels only),
+    so healthy muscle = 1 and zero background stays zero."""
+    a = np.nan_to_num(arr.astype(np.float32))
+    stem_lower = stem.lower()
+    for key, scale in QUANT_MAP_SCALE.items():
+        if key in stem_lower:
+            return np.clip(a / scale, 0.0, 1.0)
+
+    ref = a[muscle_mask & (a != 0)]
+    if ref.size == 0:
+        raise ValueError(f'{stem}: no nonzero voxels inside the healthy-muscle mask')
+    median = float(np.median(ref))
+    print(f'  [{stem}] healthy-muscle median = {median:.1f} (n={ref.size:,})')
+    return a / median
+
+
+def save_registered(arr, stem, day3_end_nib, out_dir, norm_out_dir=None,
+                    norm2_out_dir=None, muscle_mask=None):
+    """Save the raw registered array, plus optional normalized copies in
+    norm_out_dir (per-volume percentile) and norm2_out_dir (method 2)."""
     out = os.path.join(out_dir, f'{stem}_regToDay3End.nii.gz')
     nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
     print(f"  Saved → {out}")
@@ -424,70 +584,77 @@ def save_registered(arr, stem, day3_end_nib, out_dir, norm_out_dir=None):
         norm_out = os.path.join(norm_out_dir, f'{stem}_regToDay3End.nii.gz')
         nib.save(nib.Nifti1Image(norm_arr.astype(np.float32), day3_end_nib.affine), norm_out)
         print(f"  Saved normalized → {norm_out}")
+    if norm2_out_dir:
+        norm2_arr = normalize_method2(arr, stem, muscle_mask)
+        norm2_out = os.path.join(norm2_out_dir, f'{stem}_regToDay3End.nii.gz')
+        nib.save(nib.Nifti1Image(norm2_arr.astype(np.float32), day3_end_nib.affine), norm2_out)
+        print(f"  Saved normalized (method 2) → {norm2_out}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
+def run_for_rabbit(rabbit_id):
+    global _base, DAY3_DIR, DAY0_DIR, XFMS_DIR, OUT_DIR
+    global SLICER_TRANSFORM_PATH
+    global AFFINE_FIELD_PATH, SPLINES_FIELD_PATH, SDIFF_FIELD_PATH, DISPLACEMENT_CACHE
+    global MASK_THRESH, MASK_MASKTHRESH, MASK_KERNSIZE
+
+    _base     = os.path.join(RABBIT_FOLDER, rabbit_id, 'InVivo_MR', 'InVMRDataSets')
+    DAY3_DIR  = os.path.join(_base, 'Day3')
+    DAY0_DIR  = os.path.join(_base, 'Day0')
+    XFMS_DIR  = os.path.join(_base, 'Transforms')
+    OUT_DIR   = os.path.join(_base, 'Day3End_Registered')
+
+    # Registered directly as Day3_start (moving) -> Day3_end (fixed) in Slicer, so
+    # in ITK's fixed->moving pull convention this is already the transform
+    # ApplySlicerTransform needs -- no algebraic/displacement-field inversion step.
+    SLICER_TRANSFORM_PATH = os.path.join(DAY3_DIR, 'Day3_start_to_end.h5')
+    AFFINE_FIELD_PATH  = os.path.join(XFMS_DIR, 'Affine_deformation.npy')
+    SPLINES_FIELD_PATH = os.path.join(XFMS_DIR, 'SplinesProjection.npy')
+    SDIFF_FIELD_PATH   = os.path.join(XFMS_DIR, 'sdiff.npy')
+    DISPLACEMENT_CACHE = os.path.join(OUT_DIR, 'day3end_to_day0_voxel_coords.npy')
+
+    print(f"\n=== {rabbit_id} ===")
+
     os.makedirs(OUT_DIR, exist_ok=True)
     NORM_OUT_DIR = os.path.join(OUT_DIR, 'Normalized')
     if SAVE_NORMALIZED:
         os.makedirs(NORM_OUT_DIR, exist_ok=True)
+    NORM2_OUT_DIR = os.path.join(OUT_DIR, 'Normalized_method2')
+    if SAVE_NORMALIZED_METHOD2:
+        os.makedirs(NORM2_OUT_DIR, exist_ok=True)
 
-    _day3 = _load_day3_log(DAY3_DIR, RABBIT_ID)
+    _day3 = _load_day3_log(DAY3_DIR, rabbit_id)
     DAY3_END_PATH     = _day3['End'][0]
     DAY3_START_STRUCT = _day3['Fixed'][0]
     DAY3_START_EXTRA  = _day3.get('Start', [])
     print("Day3 Extras- ", DAY3_START_EXTRA)
 
-    day3_end_nib   = nib.load(DAY3_END_PATH)
-    print(DAY3_END_PATH)
+    # Grid/affine for every output comes from the top-level InVivo_MR/*.nii(.gz) file,
+    # not the Day3 log's own 'End' copy (DAY3_END_PATH, kept below only for its stem —
+    # used to name the saved structural output). Both files hold the identical scan
+    # (confirmed pixel-identical after axis permutation) but were exported on disk with
+    # different array axis conventions; MakeVoxelVolV2.py and ApplyTransforms.py's tile
+    # propagation already treat the top-level file as the canonical 'InVivo' reference,
+    # so anchoring here on the same file keeps every downstream grid consistent instead
+    # of introducing a second, conflicting convention.
+    INVIVO_REF_PATH = str(find_nii(os.path.join(RABBIT_FOLDER, rabbit_id, 'InVivo_MR')))
+    day3_end_nib   = nib.load(INVIVO_REF_PATH)
+    print(f"Day3End reference grid: {INVIVO_REF_PATH}  (naming stem from: {DAY3_END_PATH})")
     day3_start_nib = nib.load(DAY3_START_STRUCT)
-    if os.path.exists(SLICER_INV_CACHE):
-        print('Loading cached inverse transform...')
-        try:
-            inv_composite = _load_transform(SLICER_INV_CACHE)
-        except RuntimeError:
-            print('  Cache file corrupt — rebuilding...')
-            os.remove(SLICER_INV_CACHE)
-            inv_composite = None
-    else:
-        inv_composite = None
+    if not os.path.exists(SLICER_TRANSFORM_PATH):
+        raise FileNotFoundError(f"{SLICER_TRANSFORM_PATH} not found")
+    print(f'Loading {os.path.basename(SLICER_TRANSFORM_PATH)}...')
+    slicer_transform = _load_transform(SLICER_TRANSFORM_PATH)
 
-    if inv_composite is None:
-        if not SLICER_FWD_PATH:
-            raise FileNotFoundError(f"No .h5 transform found in {DAY3_DIR}")
-        print(f'Building inverse transform from {os.path.basename(SLICER_FWD_PATH)} (will be cached)...')
-        fwd_composite = sitk.CompositeTransform(_load_transform(SLICER_FWD_PATH))
-        affine        = fwd_composite.GetNthTransform(0)
-        disp_t        = sitk.DisplacementFieldTransform(fwd_composite.GetNthTransform(1))
-
-        aff_params = np.array(affine.GetParameters())
-        M_inv      = np.linalg.inv(aff_params[:9].reshape(3, 3))
-        t_inv      = -M_inv @ aff_params[9:]
-        inv_affine = sitk.AffineTransform(3)
-        inv_affine.SetFixedParameters(affine.GetFixedParameters())
-        inv_affine.SetParameters(list(M_inv.flatten()) + list(t_inv))
-
-        print('  Inverting displacement field...')
-        inv_disp_t = sitk.DisplacementFieldTransform(
-            sitk.InvertDisplacementField(disp_t.GetDisplacementField())
-        )
-
-        inv_composite = sitk.CompositeTransform(3)
-        inv_composite.AddTransform(inv_disp_t)
-        inv_composite.AddTransform(inv_affine)
-
-        with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            sitk.WriteTransform(inv_composite, tmp_path)
-            shutil.copy2(tmp_path, SLICER_INV_CACHE)
-        finally:
-            os.unlink(tmp_path)
-        print(f'  Cached → {SLICER_INV_CACHE}')
+    # Normalized-copy settings shared by every save_registered() call below
+    norm_kwargs = {'norm_out_dir': NORM_OUT_DIR if SAVE_NORMALIZED else None}
+    if SAVE_NORMALIZED_METHOD2:
+        norm_kwargs['norm2_out_dir'] = NORM2_OUT_DIR
+        norm_kwargs['muscle_mask'] = load_healthy_muscle_mask(
+            os.path.join(_base, HEALTHY_MUSCLE_MASK_NAME), day3_end_nib)
 
     # --- Build body mask from Day3_end structural ---
     if APPLY_MASK:
@@ -507,8 +674,7 @@ if __name__ == '__main__':
     # every other volume so it's available for cross-contrast comparison) ---
     day3_end_stem = os.path.basename(DAY3_END_PATH).replace('.nii.gz', '')
     end_arr = day3_end_arr * mask if APPLY_MASK else day3_end_arr
-    save_registered(end_arr, day3_end_stem, day3_end_nib, OUT_DIR,
-                     norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
+    save_registered(end_arr, day3_end_stem, day3_end_nib, OUT_DIR, **norm_kwargs)
     del day3_end_arr, end_arr
 
     # --- Day3_start extras → Day3_end (Slicer only) ---
@@ -521,9 +687,14 @@ if __name__ == '__main__':
         print(nib.load(path).header.get_data_dtype())
         h = nib.load(path).header
         print(h.get_slope_inter())  # (scl_slope, scl_inter)
+        resample_path = path
+        if MASK_TMAP_ARTIFACTS and is_t_map(path):
+            resample_path = mask_bad_coronal_slices(path)
+            if is_t1_map(path):
+                resample_path = zero_edge_tissue_planes(resample_path)
         print(f"Resampling {stem} → Day3_end ...")
         _interp = {0: sitk.sitkNearestNeighbor, 1: sitk.sitkLinear}[INTERP_ORDER]
-        arr = ApplySlicerTransform(path, DAY3_END_PATH, SLICER_INV_CACHE, interpolator=_interp)
+        arr = ApplySlicerTransform(resample_path, INVIVO_REF_PATH, SLICER_TRANSFORM_PATH, interpolator=_interp)
 
         print(f"  arr dtype: {arr.dtype}")
         print(f"  unique values sample: {np.unique(arr[arr > 0])[:20]}")
@@ -531,54 +702,64 @@ if __name__ == '__main__':
 
         if APPLY_MASK:
             arr = arr * mask
-        save_registered(arr, stem, day3_end_nib, OUT_DIR,
-                         norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
+        save_registered(arr, stem, day3_end_nib, OUT_DIR, **norm_kwargs)
 
     # --- End_native volumes → Day3_end grid (identity resample only) ---
-    day3_end_sitk = sitk.ReadImage(DAY3_END_PATH)
+    day3_end_sitk = sitk.ReadImage(INVIVO_REF_PATH)
     _interp = {0: sitk.sitkNearestNeighbor, 1: sitk.sitkLinear}[INTERP_ORDER]
     for path in _day3.get('End_native', []):
         if not os.path.exists(path):
             print(f"Skipping (not found): {path}")
             continue
         stem = os.path.basename(path).replace('.nii.gz', '')
+        resample_path = path
+        if MASK_TMAP_ARTIFACTS and is_t_map(path):
+            resample_path = mask_bad_coronal_slices(path)
+            if is_t1_map(path):
+                resample_path = zero_edge_tissue_planes(resample_path)
         print(f"Resampling {stem} → Day3_end grid (no transform) ...")
-        arr = resample_to_grid(path, day3_end_sitk, interpolator=_interp)
+        arr = resample_to_grid(resample_path, day3_end_sitk, interpolator=_interp)
         if APPLY_MASK:
             arr = arr * mask
-        save_registered(arr, stem, day3_end_nib, OUT_DIR,
-                         norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
+        save_registered(arr, stem, day3_end_nib, OUT_DIR, **norm_kwargs)
 
-    # --- Build / load Day3_end → Day0 displacement field ---
-    if os.path.exists(DISPLACEMENT_CACHE):
-        print(f"Loading cached displacement field from {DISPLACEMENT_CACHE} ...")
-        voxel_field = np.load(DISPLACEMENT_CACHE)
+    if RUN_DAY0:
+        # --- Build / load Day3_end → Day0 displacement field ---
+        if os.path.exists(DISPLACEMENT_CACHE):
+            print(f"Loading cached displacement field from {DISPLACEMENT_CACHE} ...")
+            voxel_field = np.load(DISPLACEMENT_CACHE)
+        else:
+            affine_field  = np.load(AFFINE_FIELD_PATH)
+            splines_field = np.load(SPLINES_FIELD_PATH)
+            sdiff_field   = np.load(SDIFF_FIELD_PATH)
+
+            print("Building Day3_end → Day0 displacement field (one-time cost) ...")
+            voxel_field = build_day3end_to_day0_field(
+                day3_end_nib, day3_start_nib, slicer_transform,
+                affine_field, splines_field, sdiff_field
+            )
+            np.save(DISPLACEMENT_CACHE, voxel_field)
+            print(f"  Cached → {DISPLACEMENT_CACHE}")
+
+        # --- Day0 volumes → Day3_end ---
+        day0_paths = sorted(glob.glob(os.path.join(DAY0_DIR, 'Masked', '*.nii.gz')))
+        for path in day0_paths:
+            stem = os.path.basename(path).replace('.nii.gz', '')
+            print(f"Resampling Day0/{stem} → Day3_end ...")
+            vol_arr = nib.load(path).get_fdata(dtype=np.float32)
+            arr     = resample_with_field(vol_arr, voxel_field, order=INTERP_ORDER)
+            if APPLY_MASK:
+                arr = arr * mask
+            save_registered(arr, stem, day3_end_nib, OUT_DIR, **norm_kwargs)
     else:
-        affine_field  = np.load(AFFINE_FIELD_PATH)
-        splines_field = np.load(SPLINES_FIELD_PATH)
-        sdiff_field   = np.load(SDIFF_FIELD_PATH)
+        print("RUN_DAY0=False -- skipping Day0 displacement field and resampling.")
 
-        print("Building Day3_end → Day0 displacement field (one-time cost) ...")
-        voxel_field = build_day3end_to_day0_field(
-            day3_end_nib, day3_start_nib, inv_composite,
-            affine_field, splines_field, sdiff_field
-        )
-        np.save(DISPLACEMENT_CACHE, voxel_field)
-        print(f"  Cached → {DISPLACEMENT_CACHE}")
+    print(f"All done ({rabbit_id}).")
 
-    # --- Day0 volumes → Day3_end ---
-    day0_paths = sorted(glob.glob(os.path.join(DAY0_DIR, 'Masked', '*.nii.gz')))
-    for path in day0_paths:
-        stem = os.path.basename(path).replace('.nii.gz', '')
-        print(f"Resampling Day0/{stem} → Day3_end ...")
-        vol_arr = nib.load(path).get_fdata(dtype=np.float32)
-        arr     = resample_with_field(vol_arr, voxel_field, order=INTERP_ORDER)
-        if APPLY_MASK:
-            arr = arr * mask
-        save_registered(arr, stem, day3_end_nib, OUT_DIR,
-                         norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
 
-    print("All done.")
+if __name__ == '__main__':
+    for _rabbit_id in _load_rabbit_ids(READY_RABBITS_CSV):
+        run_for_rabbit(_rabbit_id)
 
 
 # ---------------------------------------------------------------------------

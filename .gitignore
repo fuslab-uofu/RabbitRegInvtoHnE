@@ -3,4 +3,5 @@ SADMS/
 .DS_Store
 .idea/
 __pycache__/
-test_apply_transforms.py
+test_*.py
+TestData/

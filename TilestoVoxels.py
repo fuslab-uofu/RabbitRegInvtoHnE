@@ -1,12 +1,17 @@
-from PyQt5.QtWidgets import QApplication
-
 #from CZItoTiff import block_no
-from Viewer import VolumeViewer
 import sys
 import os
-os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")  # Homebrew's arm64 lib dir isn't on
-                                                                    # macOS's default dlopen search path;
-                                                                    # pyvips needs it to find libvips.42.dylib
+if sys.platform == 'darwin':
+    os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")  # Homebrew's arm64 lib dir isn't on
+                                                                        # macOS's default dlopen search path;
+                                                                        # pyvips needs it to find libvips.42.dylib
+elif sys.platform == 'linux':
+    import ctypes
+    ctypes.CDLL("/working/ProgCaches/CondaCaches/conda-envs/libvips-env/lib/libvips.so.42", mode=ctypes.RTLD_GLOBAL)
+
+import PyQt5.sip
+sys.modules.setdefault('sip', PyQt5.sip)  # landmark .npy files pickle QPointF objects, whose
+                                            # unpickler does a bare `import sip`, not `PyQt5.sip`
 import re
 import nibabel as nib
 import numpy as np

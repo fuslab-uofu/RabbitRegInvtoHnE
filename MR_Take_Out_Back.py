@@ -9,7 +9,7 @@ from pathlib import Path
 
 # --- Config ---
 CEPH_BASE  = '/System/Volumes/Data/ceph/hifu'
-Rabbit     = 'R24-082'
+Rabbit     = 'R24-058'
 Day        = 'Day0'
 template   = 'T1wCE.nii.gz'
 

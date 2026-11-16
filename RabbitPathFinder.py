@@ -6,12 +6,96 @@ import nibabel as nib
 import SimpleITK as sitk
 import numpy as np
 
+# The same ceph share is mounted at a different path on each machine: the Mac, then mara.
+CEPH_HIFU_MOUNTS = ['/System/Volumes/Data/ceph/hifu', '/ceph/hifu']
+RABBIT_REG_PROJ = 'users/jbonaventura/RabbitRegistrationProj'
+
+
+def ceph_hifu_base():
+    """This machine's ceph hifu mount: the first of CEPH_HIFU_MOUNTS that exists."""
+    for mount in CEPH_HIFU_MOUNTS:
+        if os.path.isdir(mount):
+            return mount
+    raise FileNotFoundError(f"No ceph hifu mount found here, tried {CEPH_HIFU_MOUNTS}")
+
+
+def rabbit_reg_proj_dir():
+    """RabbitRegistrationProj on this machine's ceph mount."""
+    return os.path.join(ceph_hifu_base(), RABBIT_REG_PROJ)
+
+
+def rabbit_data_dir():
+    """RabbitData (one R<id> folder per rabbit) on this machine's ceph mount."""
+    return os.path.join(rabbit_reg_proj_dir(), 'RabbitData')
+
+
+def load_ready_rabbit_blocks(csv_path=None):
+    """[(rabbit ID without its 'R' prefix, block number), ...] from ReadyRabbits.csv (default:
+    the one in RabbitRegistrationProj), the rabbit blocks whose MR registration and histology
+    are both ready for analysis. One pair per row: a rabbit with several analysed blocks has
+    one row per block."""
+    if csv_path is None:
+        csv_path = os.path.join(rabbit_reg_proj_dir(), 'ReadyRabbits.csv')
+    with open(csv_path, newline='') as f:
+        return [(row['rabbit'].strip().removeprefix('R'), int(row['block']))
+                for row in csv.DictReader(f)]
+
+
+def block_label(rabbit_id, block_num):
+    """'R23-055 Block05': names one analysed rabbit block in printouts and plot titles."""
+    return f'R{rabbit_id} Block{block_num:02d}'
+
+
+def block_analysis_dir(base_dir, rabbit_id, block_num):
+    """Per-block Analysis folder that holds that block's H&E volume and feature CSVs."""
+    return os.path.join(base_dir, f'R{rabbit_id}', 'Analysis', f'Block{block_num:02d}')
+
+
+def day3end_mr_dir(base_dir, rabbit_id, mr_norm_dir):
+    """Day3End_Registered MR folder for one rabbit: its mr_norm_dir subfolder, or the raw
+    volumes themselves when mr_norm_dir is ''."""
+    day3end_dir = os.path.join(base_dir, f'R{rabbit_id}', 'InVivo_MR/InVMRDataSets/Day3End_Registered')
+    return os.path.join(day3end_dir, mr_norm_dir) if mr_norm_dir else day3end_dir
+
+
+def class_predictions_dir(rabbit_id, block_num, label_source):
+    """ProjectClassPredictionsToMR.py's output folder for one block and label source."""
+    return (Path(__file__).parent / 'TestData' /
+            f'R{rabbit_id}_Block{block_num:02d}_ClassPredictions_{label_source}')
+
+
+def class_fraction_col(class_name):
+    """Feature-table column holding a voxel's (or tile's / patch's mean) fraction of class_name."""
+    return f'{class_name}_fraction'
+
+
+def mr_norm_csv_suffix(mr_norm_dir):
+    """Feature-CSV filename suffix naming the Day3End_Registered subfolder the MR volumes
+    were read from ('' = the raw volumes), so each normalization keeps its own CSVs."""
+    return f'_{mr_norm_dir}' if mr_norm_dir else '_raw'
+
+
 def find_nii(directory):
     for ext in ("*.nii.gz", "*.nii"):
         matches = [p for p in Path(directory).glob(ext) if not p.name.startswith("._")]
         if matches:
             return matches[0]
     return None
+
+def find_single_transform(reg_fold, ext):
+    """Return the one transform file with extension ext ('.h5' or '.pt') in reg_fold.
+    Stops if there are none or several -- with several, there's no reliable way to tell
+    which is current, and picking the wrong one silently gives a stale registration."""
+    matches = sorted(p for p in Path(reg_fold).glob(f"*{ext}") if not p.name.startswith("._"))
+    if not matches:
+        raise FileNotFoundError(f"No {ext} transform found in {reg_fold}")
+    if len(matches) > 1:
+        names = "\n  ".join(p.name for p in matches)
+        raise RuntimeError(
+            f"Found {len(matches)} {ext} transforms in {reg_fold}:\n  {names}\n"
+            f"Delete the old one(s) so only the current transform is left, then rerun."
+        )
+    return matches[0]
 
 def get_assess_data(parent_folder):
     assess_folder = os.path.join(parent_folder, 'RegAssessData')
@@ -96,6 +180,8 @@ def find_day3_paths(RabbitID, pathtoRabbits):
         elif category == 'End':     end_vols.append(path)
         elif category == 'Fixed':   fixed_vols.append(path)
 
+    day3end_registered_dir = os.path.join(os.path.dirname(day3_dir), 'Day3End_Registered')
+
     return {
         'day3_dir':            day3_dir,
         'start_vols':          start_vols,
@@ -104,6 +190,9 @@ def find_day3_paths(RabbitID, pathtoRabbits):
         'transform_path':      os.path.join(day3_dir, 'Day3_end_to_start_Transform.h5'),
         'inv_transform_cache': os.path.join(day3_dir, 'Day3_end_to_start_inv_cached.h5'),
         'aps_transform_folder': os.path.join(os.path.dirname(day3_dir), 'Transforms'),
+        'day3end_registered_dir': day3end_registered_dir,
+        # Day3 start/fixed volumes already resampled onto the End-Day3 (target_space="InVivo") grid
+        'registered_vols':     sorted(glob.glob(os.path.join(day3end_registered_dir, '*_regToDay3End.nii.gz'))),
     }
 
 
