@@ -1,6 +1,6 @@
 # MR -> H&E analysis of the Stage 2 patch table (RadioDino embeddings per 16x16 patch, from
 # ExtractMRFeatures.py): LORO or LOBO regression of each H&E class fraction from the embeddings
-# vs a patch-mean intensity baseline.
+# (Stage 2). Patch-mean MR intensity is only used for the diagnostics, not as a model.
 
 import os
 from pathlib import Path
@@ -15,7 +15,7 @@ from sklearn.model_selection import GroupKFold, cross_val_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from MultiRabAnalysis import build_model
-from MSPredAndAnalysis import (CV_HOLDOUT_UNITS, classify_predictor_stage, holdout_folds,
+from MSPredAndAnalysis import (CV_HOLDOUT_UNITS, classify_predictor_stage, cv_tables, holdout_folds,
                                load_rabbit_table, per_block_correlations, plot_correlation_heatmap,
                                predictor_standardization, print_correlation_tables,
                                restrict_tables_to_common_predictors, results_to_frame,
@@ -95,14 +95,18 @@ def held_out_predictions(tables, results, label):
     return pd.DataFrame(columns)
 
 
-def prediction_level_summary(predictions, prediction_cols):
-    """Per held-out fold (patch_target_frame's 'held_out'): its mean target, the rest's mean
-    target (the level its model is trained on), and per prediction column the mean prediction,
-    R², and R² once that fold's mean prediction error (the offset) is removed."""
+def prediction_level_summary(predictions, prediction_cols, cv_mode='loro'):
+    """Per held-out fold (patch_target_frame's 'held_out'): its mean target, its training rows'
+    mean target (the level its model is trained on: the other folds, or for 'lobo' the same
+    rabbit's other blocks), and per prediction column the mean prediction, R², and R² once that
+    fold's mean prediction error (the offset) is removed."""
     rows = []
     for unit, held_out in predictions.groupby('held_out', sort=False):
+        train = predictions['held_out'] != unit
+        if cv_mode == 'lobo':
+            train &= predictions['rabbit'] == held_out['rabbit'].iloc[0]
         row = {'held_out': unit, 'target_mean': held_out['target'].mean(),
-               'train_target_mean': predictions.loc[predictions['held_out'] != unit, 'target'].mean()}
+               'train_target_mean': predictions.loc[train, 'target'].mean()}
         for col in prediction_cols:
             predicted = held_out[col].notna()
             y, y_pred = held_out.loc[predicted, 'target'], held_out.loc[predicted, col]
@@ -138,7 +142,8 @@ if __name__ == '__main__':
     # Embedding PCs kept per fold; every value is run and reported.
     PCA_COMPONENTS = [10, 25, 50]
     CORR_VALUE = 'spearman_rho'  # or 'pearson_r'
-    # 'loro' = hold out a whole rabbit (all its blocks) per fold; 'lobo' = hold out one block.
+    # 'loro' = hold out a whole rabbit (all its blocks) per fold, train on the other rabbits;
+    # 'lobo' = hold out one block, train only on that rabbit's other blocks (multi-block rabbits only).
     CV_MODE = 'loro'
     RUN_RABBIT_ID = True
     RUN_MODELS = True
@@ -172,10 +177,9 @@ if __name__ == '__main__':
     run_dir = Path(__file__).parent / 'TestData' / 'PatchEmbeddingCV' / RUN_NAME
     for class_name, target_col in zip(CLASS_NAMES, target_cols):
         target_tables = select_target(tables, target_col)
-        intensity_tables = select_stage_predictors(target_tables, 'stage0')
 
         print(f"\n--- Per-block correlations of patch-mean MR intensity with {target_col} ---")
-        corr = per_block_correlations(intensity_tables)
+        corr = per_block_correlations(select_stage_predictors(target_tables, 'stage0'))
         print_correlation_tables(corr, value=CORR_VALUE)
         if SHOW_CORR_PLOTS:
             plot_correlation_heatmap(corr, value=CORR_VALUE, target_label=target_col)
@@ -189,9 +193,10 @@ if __name__ == '__main__':
         predictions_path = os.path.join(out_dir, f'{CV_MODE}_predictions.csv')
         frames = []
         # Every stage shares the same patches, so predictions are added as columns.
-        predictions = patch_target_frame(target_tables, CV_MODE)
+        predictions = patch_target_frame(cv_tables(target_tables, CV_MODE), CV_MODE)
 
         def run_stage(label, stage_tables, model_builder):
+            stage_tables = cv_tables(stage_tables, CV_MODE)
             print(f"\n=== {target_col}: {label} ({len(stage_tables[0].predictor_names)} predictor(s)) ===")
             results = run_model_comparison(holdout_folds(stage_tables, CV_MODE), MODEL_TYPES,
                                            model_builder=model_builder)
@@ -202,18 +207,15 @@ if __name__ == '__main__':
             predictions.to_csv(predictions_path, index=False, float_format='%.5g')
             print(f"Saved {CV_MODE.upper()} metrics to {metrics_path} and predictions to {predictions_path}")
 
-        # Baseline on the same rows: patch-mean intensity of each contrast, no embeddings.
-        run_stage('stage0', intensity_tables, build_model)
-        for stage in ('stage2', 'stage0_2'):
-            stage_tables = select_stage_predictors(target_tables, stage)
-            names = stage_tables[0].predictor_names
-            for n_components in PCA_COMPONENTS:
-                run_stage(f'{stage}_pca{n_components}', stage_tables,
-                          lambda model_type: embedding_pca_model(model_type, names, n_components))
+        stage_tables = select_stage_predictors(target_tables, 'stage2')
+        names = stage_tables[0].predictor_names
+        for n_components in PCA_COMPONENTS:
+            run_stage(f'stage2_pca{n_components}', stage_tables,
+                      lambda model_type: embedding_pca_model(model_type, names, n_components))
 
         print(f"\n=== {target_col}: {CV_MODE.upper()} summary, mean over held-out folds ===")
         with pd.option_context('display.width', 200):
             print(summarize_loro(pd.concat(frames, ignore_index=True)).round(3))
-            print("\n=== Prediction level per held-out fold, patch-mean intensity baseline ===")
+            print("\n=== Prediction level per held-out fold, embedding models ===")
             print(prediction_level_summary(
-                predictions, [f'stage0_{model_type}' for model_type in MODEL_TYPES]).round(3).T)
+                predictions, [c for c in predictions.columns if c.startswith('stage2_')], CV_MODE).round(3).T)

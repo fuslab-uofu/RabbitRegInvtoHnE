@@ -121,20 +121,22 @@ def classify_predictor_stage(name):
     return 'stage0'
 
 
-# Predictor classes each stage selection keeps (the '0_' selections are additive).
+# Predictor classes each stage keeps; stage1a and stage1b include their table's raw/mean MR.
 STAGE_SELECTIONS = {
     'stage0': {'stage0'},
-    'stage0_1a': {'stage0', 'stage1a'},
-    'stage1b': {'stage1b'},
-    'stage0_1b': {'stage0', 'stage1b'},
+    'stage1a': {'stage0', 'stage1a'},
+    'stage1b': {'stage0', 'stage1b'},
     'stage2': {'stage2'},
-    'stage0_2': {'stage0', 'stage2'},
 }
+# The ExtractMRFeatures.py table each stage reads: stage0/stage1a the voxel table, stage1b a tile
+# table (its tile-mean MR columns count as 'stage0' there, so stage1b = tile mean + radiomics),
+# stage2 the patch table (analysed by PatchEmbeddingPredAndAnalysis.py).
+STAGE_TABLES = {'stage0': 'voxel', 'stage1a': 'voxel', 'stage1b': 'tile', 'stage2': 'patch'}
 
 
 def select_stage_predictors(tables, stage):
     """Keep one STAGE_SELECTIONS entry's predictors, e.g. 'stage0' = raw MR intensity only,
-    'stage0_1a' = raw + derived, 'stage0_2' = raw + embeddings."""
+    'stage1a' = raw + derived, 'stage1b' = tile mean + radiomics, 'stage2' = embeddings."""
     if stage not in STAGE_SELECTIONS:
         raise ValueError(f"Unknown stage: {stage!r}, expected one of {sorted(STAGE_SELECTIONS)}")
     kept_classes = STAGE_SELECTIONS[stage]
@@ -243,17 +245,33 @@ def pooled_feature_pca(tables, n_components=10):
     return scores, loadings, explained
 
 
-# What one cross-validation fold holds out, named per table: 'loro' = a whole rabbit (all of
-# its blocks together, so no block of the test rabbit is trained on), 'lobo' = one block.
+# What one cross-validation fold holds out, named per table:
+#   'loro' = a whole rabbit (all of its blocks together), trained on every other rabbit;
+#   'lobo' = one block, trained ONLY on the same rabbit's other blocks (no other rabbits), i.e.
+#            within-animal generalization; only rabbits with several blocks get folds.
 CV_HOLDOUT_UNITS = {
     'loro': lambda t: f'R{t.rabbit_id}',
     'lobo': table_label,
 }
 
 
+def cv_tables(tables, cv_mode):
+    """The tables cv_mode makes folds for: every table for 'loro'; for 'lobo', only blocks of
+    rabbits with several blocks (a single-block rabbit has nothing of its own to train on)."""
+    if cv_mode != 'lobo':
+        return tables
+    n_blocks = pd.Series([t.rabbit_id for t in tables]).value_counts()
+    kept = [t for t in tables if n_blocks[t.rabbit_id] > 1]
+    dropped = sorted({f'R{t.rabbit_id}' for t in tables if n_blocks[t.rabbit_id] == 1})
+    print(f"LOBO (within-rabbit): {len(kept)} block(s) from {len({t.rabbit_id for t in kept})} "
+          f"multi-block rabbit(s); single-block rabbit(s) skipped: {dropped}")
+    return kept
+
+
 def holdout_folds(tables, cv_mode='loro'):
-    """One fold per held-out unit of cv_mode (see CV_HOLDOUT_UNITS): train on every other
-    table's rows pooled, test on the held-out tables' rows stacked. Yields (held-out name,
+    """One fold per held-out unit of cv_mode (see CV_HOLDOUT_UNITS): train on the other
+    tables' rows pooled ('lobo': only the held-out block's own rabbit's other blocks), test on
+    the held-out tables' rows stacked. Pass cv_tables(tables, cv_mode). Yields (held-out name,
     held-out tables, train_mr, train_target, test_mr, test_target) one fold at a time, so
     only one fold's training matrix is in memory."""
     if cv_mode not in CV_HOLDOUT_UNITS:
@@ -262,6 +280,11 @@ def holdout_folds(tables, cv_mode='loro'):
     for unit in dict.fromkeys(unit_of(t) for t in tables):
         held_out = [t for t in tables if unit_of(t) == unit]
         train_parts = [t for t in tables if unit_of(t) != unit]
+        if cv_mode == 'lobo':
+            train_parts = [t for t in train_parts if t.rabbit_id == held_out[0].rabbit_id]
+            if not train_parts:
+                raise ValueError(f"{unit} has no other block of its rabbit to train on; "
+                                 f"pass cv_tables(tables, 'lobo')")
         yield (unit, held_out,
                np.vstack([t.mr_features for t in train_parts]),
                np.concatenate([t.target for t in train_parts]),
@@ -631,63 +654,67 @@ if __name__ == '__main__':
     TARGET = 'class_fractions'
     CLASS_LABEL_SOURCE = 'R3_softmax'  # ExtractMRFeatures.py's LABEL_SOURCE
     CLASS_NAMES = ['muscle', 'immune_cells', 'necrotic_tissue']
-    # Must match ExtractMRFeatures.py's MR_NORM_DIR and VOXEL_CSV_NAME
-    # ('voxel_features_by_id<suffix>.csv' = every contrast common to all rabbits).
+    # Must match ExtractMRFeatures.py's MR_NORM_DIR (CSV names carry it and the label source).
     MR_NORM_DIR = 'Normalized_method2'
     CSV_SUFFIX = mr_norm_csv_suffix(MR_NORM_DIR) + (f'_{CLASS_LABEL_SOURCE}' if TARGET == 'class_fractions' else '')
-    # Which feature table to analyse: 'voxel' = Stage 0/1a voxel table; a number = that Stage 1b
-    # tile size (one of ExtractMRFeatures.py's TILE1B_SIZES: 3, 7, 11, 16), one row per tile.
-    FEATURE_TABLE = 'voxel'
-    if FEATURE_TABLE == 'voxel':
-        CSV_NAME, TABLE_TAG = f'voxel_features_by_id{CSV_SUFFIX}.csv', ''
-    else:
-        CSV_NAME, TABLE_TAG = f'tile_features_by_id_size{FEATURE_TABLE}{CSV_SUFFIX}.csv', f'_tile{FEATURE_TABLE}'
     TARGET_COLS = ([FEATURE_COL] if TARGET == 'he_feature' else
                    [class_fraction_col(c) for c in CLASS_NAMES])
     MODEL_TYPES = ['rf', 'xgboost', 'linear']
     METRIC_NAMES = ['r2', 'rmse', 'mae', 'pearson_r', 'spearman_rho']
-    # 'stage0' = raw MR (tile mean for a tile table) only, the baseline, runs first;
-    # 'stage0_1a' = raw + derived (voxel table); 'stage0_1b' = tile mean + radiomics (tile table).
-    STAGES = ['stage0'] if FEATURE_TABLE == 'voxel' else ['stage0', 'stage0_1b']
-    # Correlation tables always run; CV models only when RUN_MODELS is True.
+    # Stages to model, in order (Stage 2 runs in PatchEmbeddingPredAndAnalysis.py):
+    #   'stage0'  = raw MR per voxel (the baseline);
+    #   'stage1a' = raw MR + neighbourhood/gradient features per voxel;
+    #   'stage1b' = tile-mean MR + radiomics per TILE1B_SIZE tile ('linear' is unreliable here:
+    #               plain least squares on hundreds of correlated radiomics; read rf/xgboost).
+    STAGES = ['stage0', 'stage1a', 'stage1b']
+    TILE1B_SIZE = 16  # one of ExtractMRFeatures.py's TILE1B_SIZES (3, 7, 11, 16)
+    STAGE_CSV_NAMES = {'voxel': f'voxel_features_by_id{CSV_SUFFIX}.csv',
+                       'tile': f'tile_features_by_id_size{TILE1B_SIZE}{CSV_SUFFIX}.csv'}
+    # Correlation tables (voxel table) always run; CV models only when RUN_MODELS is True.
     CORR_VALUE = 'spearman_rho'  # or 'pearson_r'
     RUN_MODELS = True
-    # 'loro' = hold out a whole rabbit (all its blocks) per fold; 'lobo' = hold out one block.
+    # 'loro' = hold out a whole rabbit (all its blocks) per fold, train on the other rabbits;
+    # 'lobo' = hold out one block, train only on that rabbit's other blocks (multi-block rabbits only).
     CV_MODE = 'loro'
-    RUN_PCA = True  # pooled PCA of all MR features, saved for building figures
-    SHOW_CORR_PLOTS = True  # correlation dot plot + raw MR vs H&E scatter (per rabbit and pooled)
-    # Outputs (metrics, NIfTIs, PCA, figures/) go to TestData/LOROPredictions/<RUN_NAME>/; use a new
-    # name per run. A tile table's folders and figures carry TABLE_TAG, so it shares a run with the voxel table.
+    RUN_PCA = True  # pooled PCA of the voxel table's MR features, saved for building figures
+    SHOW_CORR_PLOTS = True  # correlation dot plot + raw MR vs H&E scatter (per block and pooled)
+    # Outputs (metrics, NIfTIs, PCA, figures/) go to TestData/LOROPredictions/<RUN_NAME>/; use a new name per run.
     RUN_NAME = 'R3_softmax_Method2'
     SHOW_FIGURES = False  # False = save figures only, so the run never pauses on plot windows
 
-    tables = []
-    for rabbit_id, block_num in RABBIT_BLOCKS:
-        t = load_rabbit_table(rabbit_id, block_num, BASE_DIR, CSV_NAME, TARGET_COLS)
-        if t is not None:
-            tables.append(t)
+    def load_feature_tables(csv_name):
+        """Every ready block's table from csv_name, restricted to the predictors all blocks share."""
+        loaded = []
+        for rabbit_id, block_num in RABBIT_BLOCKS:
+            t = load_rabbit_table(rabbit_id, block_num, BASE_DIR, csv_name, TARGET_COLS)
+            if t is not None:
+                loaded.append(t)
+        print(f"--- Predictor standardization ({csv_name}) ---")
+        return restrict_tables_to_common_predictors(loaded, predictor_standardization(loaded))
 
-    print(f"--- Predictor standardization ({CSV_NAME}) ---")
-    common = predictor_standardization(tables)
-    tables = restrict_tables_to_common_predictors(tables, common)
+    if 'stage2' in STAGES:
+        raise ValueError("Stage 2 runs in PatchEmbeddingPredAndAnalysis.py; remove it from STAGES here")
+    # Only the tables some stage (or the voxel correlations/PCA) needs are loaded.
+    needed_tables = {STAGE_TABLES[s] for s in STAGES} | {'voxel'}
+    tables_by_kind = {kind: load_feature_tables(STAGE_CSV_NAMES[kind]) for kind in sorted(needed_tables)}
+    voxel_tables = tables_by_kind['voxel']
 
     run_dir = Path(__file__).parent / 'TestData' / 'LOROPredictions' / RUN_NAME
     fig_dir = str(run_dir / 'figures')
     os.makedirs(fig_dir, exist_ok=True)
 
-    # (target name, tables with that target, output folder name under run_dir, also the figure name prefix)
+    # (target name, target column, output folder name under run_dir, also the figure name prefix)
     if TARGET == 'he_feature':
-        targets = [(FEATURE_COL, tables, f'{FEATURE_COL}{TABLE_TAG}')]
+        targets = [(FEATURE_COL, FEATURE_COL, FEATURE_COL)]
     elif TARGET == 'class_fractions':
-        targets = [(f'{c} fraction ({CLASS_LABEL_SOURCE})',
-                    select_target(tables, class_fraction_col(c)),
-                    f'class_{CLASS_LABEL_SOURCE}_{c}{TABLE_TAG}')
+        targets = [(f'{c} fraction ({CLASS_LABEL_SOURCE})', class_fraction_col(c), f'class_{CLASS_LABEL_SOURCE}_{c}')
                    for c in CLASS_NAMES]
     else:
         raise ValueError(f"Unknown TARGET {TARGET!r}")
 
-    for target_name, target_tables, out_name in targets:
-        print(f"\n--- Per-block correlations with {target_name} (every predictor in {CSV_NAME}) ---")
+    for target_name, target_col, out_name in targets:
+        target_tables = select_target(voxel_tables, target_col)
+        print(f"\n--- Per-block correlations with {target_name} (voxel table: Stage 0 raw + Stage 1a derived) ---")
         corr = per_block_correlations(target_tables)
         print_correlation_tables(corr, value=CORR_VALUE)
         if SHOW_CORR_PLOTS:
@@ -695,11 +722,10 @@ if __name__ == '__main__':
                         fig_dir, f'{out_name}_corr_dots')
             save_figure(plot_correlation_heatmap(corr, value=CORR_VALUE, target_label=target_name),
                         fig_dir, f'{out_name}_corr_heatmap_raw')
-            if FEATURE_TABLE == 'voxel':  # these variants are Stage 1a columns, voxel table only
-                save_figure(plot_correlation_heatmap(corr, value=CORR_VALUE,
-                                                     variants=('raw', 'nbhd_std_2d_r3', 'grad_3d'),
-                                                     target_label=target_name),
-                            fig_dir, f'{out_name}_corr_heatmap_variants')
+            save_figure(plot_correlation_heatmap(corr, value=CORR_VALUE,
+                                                 variants=('raw', 'nbhd_std_2d_r3', 'grad_3d'),
+                                                 target_label=target_name),
+                        fig_dir, f'{out_name}_corr_heatmap_variants')
             save_figure(plot_raw_feature_scatter(target_tables, corr, target_label=target_name),
                         fig_dir, f'{out_name}_scatter_per_rabbit')
             save_figure(plot_raw_feature_scatter(target_tables, corr, pooled=True,
@@ -708,9 +734,9 @@ if __name__ == '__main__':
             plt.show() if SHOW_FIGURES else plt.close('all')
 
     if RUN_PCA:
-        pca_dir = str(run_dir / f'MRFeaturePCA{TABLE_TAG}')
+        pca_dir = str(run_dir / 'MRFeaturePCA')
         os.makedirs(pca_dir, exist_ok=True)
-        scores, loadings, explained = pooled_feature_pca(tables)
+        scores, loadings, explained = pooled_feature_pca(voxel_tables)
         scores.to_csv(os.path.join(pca_dir, 'pca_scores.csv'), index=False, float_format='%.5g')
         loadings.to_csv(os.path.join(pca_dir, 'pca_loadings.csv'), index_label='predictor')
         explained.to_csv(os.path.join(pca_dir, 'pca_explained_variance.csv'), index_label='component')
@@ -719,26 +745,28 @@ if __name__ == '__main__':
     if RUN_MODELS:
         # CV metrics table and held-out prediction NIfTIs per target, for building figures
         # without refitting.
-        for target_name, target_tables, out_name in targets:
+        for target_name, target_col, out_name in targets:
             out_dir = str(run_dir / out_name)
             os.makedirs(out_dir, exist_ok=True)
             metrics_path = os.path.join(out_dir, f'{CV_MODE}_metrics.csv')
             frames = []
             for stage in STAGES:
-                print(f"\n=== {target_name}: {stage} ===")
-                stage_tables = select_stage_predictors(target_tables, stage)
-                print(f"{len(stage_tables[0].predictor_names)} predictor(s) for {stage}: "
-                      f"{list(stage_tables[0].predictor_names)}")
+                # Names the tile size for stage1b, so runs at different sizes keep separate outputs.
+                stage_label = f'{stage}_tile{TILE1B_SIZE}' if STAGE_TABLES[stage] == 'tile' else stage
+                print(f"\n=== {target_name}: {stage_label} ===")
+                table = select_target(tables_by_kind[STAGE_TABLES[stage]], target_col)
+                stage_tables = cv_tables(select_stage_predictors(table, stage), CV_MODE)
+                print(f"{len(stage_tables[0].predictor_names)} predictor(s) for {stage_label}")
 
                 folds = holdout_folds(stage_tables, CV_MODE)
                 results = run_model_comparison(folds, MODEL_TYPES)
-                frames.append(results_to_frame(results, stage).assign(target=target_name))
+                frames.append(results_to_frame(results, stage_label).assign(target=target_name))
                 pd.concat(frames, ignore_index=True).to_csv(metrics_path, index=False)
                 print(f"Saved {CV_MODE.upper()} metrics to {metrics_path}")
-                save_prediction_volumes(stage_tables, results, stage, BASE_DIR, MR_NORM_DIR, out_dir,
+                save_prediction_volumes(stage_tables, results, stage_label, BASE_DIR, MR_NORM_DIR, out_dir,
                                         CV_MODE)
                 save_figure(plot_metric_comparison(results, MODEL_TYPES, METRIC_NAMES,
-                                                   stage_label=f'{target_name}, {stage}',
+                                                   stage_label=f'{target_name}, {stage_label}',
                                                    cv_mode=CV_MODE),
-                            fig_dir, f'{out_name}_{CV_MODE}_{stage}_metrics')
+                            fig_dir, f'{out_name}_{CV_MODE}_{stage_label}_metrics')
                 plt.show() if SHOW_FIGURES else plt.close('all')
