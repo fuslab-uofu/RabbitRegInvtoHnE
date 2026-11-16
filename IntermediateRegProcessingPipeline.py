@@ -94,15 +94,10 @@ def PrepInVivoToExVivo(RabbitID, RabbitFolder, Block):
     path don't depend on Block, so it only needs to run once no matter how many
     blocks the rabbit has -- Block is only passed through to satisfy
     find_all_the_paths()'s signature, it has no effect on this stage's paths.
-    Skips if the output already exists.
+    Always overwrites the output, so a redone Slicer affine takes effect.
     """
     paths = find_all_the_paths(RabbitID, Block, RabbitFolder, "InVivo")
-    output_path = os.path.join(paths['RegDataProc'], "InVivoResampledToExVivo.nii.gz")
-    if os.path.exists(output_path):
-        print(f"{output_path} already exists, skipping InVivo->ExVivo resample.")
-        return
-
-    SlicerTPath = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
+    SlicerTPath = find_single_transform(paths['RegFold'], ".h5")
 
     PrepForLandMarker(
         movingimpath = paths['Moving_FilePath'],
@@ -127,7 +122,7 @@ def PrepExVivoToExVivoBlock(RabbitID, Block, RabbitFolder, thresh, maskthresh, k
     """
     moving_key, fixed_key = "ExVivo", "ExVivoBlock"
     paths = find_all_the_paths(RabbitID, Block, RabbitFolder, moving_key)
-    SlicerTPath = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
+    SlicerTPath = find_single_transform(paths['RegFold'], ".h5")
 
     PrepForLandMarker(
         movingimpath = paths['Moving_FilePath'],
@@ -155,7 +150,7 @@ def PrepExVivoBlockToBlockFace(RabbitID, Block, RabbitFolder):
     # Ensure greyscale NIfTI exists before proceeding
     paths["Fixed_FilePath"] = BlockFaceToNifti(paths["Fixed_Folder"])
 
-    SlicerTPath = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
+    SlicerTPath = find_single_transform(paths['RegFold'], ".h5")
 
     PrepForLandMarker(
         movingimpath = paths['Moving_FilePath'],
@@ -211,23 +206,39 @@ def RunRegistrationPipelineForRabbit(RabbitID, Blocks, RabbitFolder, interactive
         PrepExVivoBlockToBlockFace(RabbitID, Block, RabbitFolder)
 
 
+def RunAllReadyBlocks(RabbitID, Block, RabbitFolder):
+    """First-time prep of a whole rabbit: InVivo->ExVivo once, then the two block-level
+    stages for every block that's ready. Block is unused -- blocks are discovered."""
+    Blocks = discover_ready_blocks(RabbitID, RabbitFolder)
+    print(f"Found {len(Blocks)} block(s) ready to process for {RabbitID}: {Blocks}")
+    RunRegistrationPipelineForRabbit(RabbitID, Blocks, RabbitFolder)
+
+
+#Each stage preps one registration step's moving volume for LandMarker.
+STAGES = {
+    "InVivoToExVivo":         lambda RabbitID, Block, RabbitFolder: PrepInVivoToExVivo(RabbitID, RabbitFolder, Block),
+    "ExVivoToExVivoBlock":    lambda RabbitID, Block, RabbitFolder: PrepExVivoToExVivoBlock(
+                                  RabbitID, Block, RabbitFolder, DEFAULT_THRESH, DEFAULT_MASKTHRESH, DEFAULT_KERNSIZE),
+    "ExVivoBlockToBlockFace": PrepExVivoBlockToBlockFace,
+    "AllReadyBlocks":         RunAllReadyBlocks,
+}
+
+
+def run_stage(stage, RabbitID, Block, RabbitFolder):
+    if stage not in STAGES:
+        raise ValueError(f"Unknown STAGE '{stage}'. Choose one of: {', '.join(STAGES)}")
+    STAGES[stage](RabbitID, Block, RabbitFolder)
+
+
 #Set which Rabbit we want, RabbitData is where it all lives, folder structure matters here->
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R24-064"
-Block = 4  # only used by the two block-level stages below
+RabbitID="R24-103"
+Block = 4  # not used by InVivoToExVivo or AllReadyBlocks
 
-# --- Stage 1: InVivo -> ExVivo (once per rabbit, Block value doesn't matter) ---
-#PrepInVivoToExVivo(RabbitID, RabbitFolder, Block)
+#Which step to re-prep for LandMarker. Only rerun after redoing that step's Slicer affine->
+# "InVivoToExVivo", "ExVivoToExVivoBlock", "ExVivoBlockToBlockFace",
+# or "AllReadyBlocks" for first-time prep of every ready block of a rabbit.
+STAGE = "ExVivoToExVivoBlock"
 
-# --- Stage 2: ExVivo -> ExVivoBlock ---
-# Devs haven't flushed that out yet as its own standalone stage.
-thresh, maskthresh, kernsize = DEFAULT_THRESH, DEFAULT_MASKTHRESH, DEFAULT_KERNSIZE
-thresh, maskthresh, kernsize = PrepExVivoToExVivoBlock(RabbitID, Block, RabbitFolder, thresh, maskthresh, kernsize)
-
-# --- Stage 3: ExVivoBlock -> BlockFace (one block at a time) ---
-#PrepExVivoBlockToBlockFace(RabbitID, Block, RabbitFolder)
-
-# --- Full batch run (all ready blocks, both remaining stages) -- uncomment to use instead of the above ---
-# Blocks = discover_ready_blocks(RabbitID, RabbitFolder)
-# print(f"Found {len(Blocks)} block(s) ready to process for {RabbitID}: {Blocks}")
-# RunRegistrationPipelineForRabbit(RabbitID, Blocks, RabbitFolder)
+if __name__ == '__main__':
+    run_stage(STAGE, RabbitID, Block, RabbitFolder)

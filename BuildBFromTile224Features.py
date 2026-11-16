@@ -109,17 +109,23 @@ def calibrate_balanced_proba(p_raw, pi_true):
     return odds / (1 + odds)
 
 
-def load_clean_q_lookup(pred_csv_path, pi_clean):
-    """tile_id -> calibrated P(clean), as a pandas Series -- pulled straight from
-    predict_from_cache.py's bulk output (x0,y0,x1,y1,clean,defect -- no tile_id
-    column, so it's derived here the same way bilinear_tile_pull derives tile_ids
-    for pixels). This is the admission-threshold criterion, not a sampling weight."""
-    df = pd.read_csv(pred_csv_path)
+def load_tile_box_lookup(csv_path, value_col):
+    """tile_id -> value_col, as a pandas Series, for CSVs that identify tiles by box
+    corners (x0,y0,x1,y1) rather than tile_name -- e.g. predict_from_cache.py's bulk
+    prediction output. tile_id is derived the same way bilinear_tile_pull derives
+    tile_ids for pixels."""
+    df = pd.read_csv(csv_path)
     col = np.floor(df['x0'].to_numpy() / TILE_SIZE).astype(np.int64)
     row = np.floor(df['y0'].to_numpy() / TILE_SIZE).astype(np.int64)
     tile_ids = (row + 10000) * 100000 + (col + 10000)
-    q = calibrate_balanced_proba(df['clean'].to_numpy(), pi_clean)
-    return pd.Series(q, index=tile_ids)
+    return pd.Series(df[value_col].to_numpy(), index=tile_ids)
+
+
+def load_clean_q_lookup(pred_csv_path, pi_clean):
+    """tile_id -> calibrated P(clean), as a pandas Series, from the defect/clean
+    predictions. This is the admission-threshold criterion, not a sampling weight."""
+    p_raw = load_tile_box_lookup(pred_csv_path, 'clean')
+    return pd.Series(calibrate_balanced_proba(p_raw.to_numpy(), pi_clean), index=p_raw.index)
 
 
 def bilinear_tile_pull(x, y, tile_size, lookup):
@@ -166,10 +172,12 @@ def bilinear_tile_pull(x, y, tile_size, lookup):
     return value, weight_total
 
 
-def build_b_and_Q_from_tile_features(RabbitID, Block, RabbitFolder, feature_col, thresholds=(None,),
+def build_b_and_Q_from_tile_features(RabbitID, Block, RabbitFolder, feature_cols, thresholds=(None,),
                                       tile_size=TILE_SIZE, scale_fac=SCALE_FAC,
-                                      ceph_base='/System/Volumes/Data/ceph/hifu'):
-    """{threshold: (b, Q, target_affine)}, one entry per requested admission threshold.
+                                      ceph_base='/System/Volumes/Data/ceph/hifu',
+                                      feature_csv_dir=None):
+    """{(feature_col, threshold): (b, Q, target_affine)}, one entry per requested feature
+    column and admission threshold.
     `None` means no defect filtering at all (baseline); a float in [0,1] means only
     tiles with calibrated P(clean) >= threshold are admitted into b -- everything else
     is treated exactly like an off-tissue tile (excluded from the bilinear blend, not
@@ -177,14 +185,18 @@ def build_b_and_Q_from_tile_features(RabbitID, Block, RabbitFolder, feature_col,
     was admitted -- see module docstring for why Q isn't a continuous defect weight.
 
     Shares the expensive per-slide work (landmark load, TPS spline fit, the per-pixel
-    coordinate pull through it) across every requested threshold -- only the cheap
-    bilinear pull itself is redone per threshold, since filtering changes which tiles
-    are admitted.
+    coordinate pull through it) across every requested feature column and threshold --
+    only the cheap bilinear pull itself is redone per (feature, threshold), since each
+    feature has its own tile values and filtering changes which tiles are admitted.
 
     Also returns (corners, source_shape, source_affine): the trilinear-stencil and
     MR-grid geometry needed for NewtonAdjointInit.normalized_adjoint_init, computed
     once here since it reuses the same `h` this function already loads -- avoids a
     second, expensive load_moving_vox/ComposedReg call in __main__.
+
+    feature_csv_dir: if given, feature_cols are read from that folder's per-slide
+    {czi_stem}_corrected_fullres_pred.csv (box-corner prediction CSVs, e.g. class
+    probabilities) instead of the slide's QuPath cellcount CSV.
     """
     need_predictions = any(t is not None for t in thresholds)
 
@@ -213,7 +225,7 @@ def build_b_and_Q_from_tile_features(RabbitID, Block, RabbitFolder, feature_col,
     source_shape, source_affine = load_source_geometry(RabbitID, Block, RabbitFolder)
     corners = _trilinear_stencil(h, source_shape)
 
-    arrays = {t: (np.zeros((X, Y, Z)), np.zeros((X, Y, Z))) for t in thresholds}
+    arrays = {(f, t): (np.zeros((X, Y, Z)), np.zeros((X, Y, Z))) for f in feature_cols for t in thresholds}
 
     hne_filenames = sorted(f for f in os.listdir(reg_HnE_dir)
                             if f.lower().endswith('reg.png') and not f.startswith('._'))
@@ -231,11 +243,17 @@ def build_b_and_Q_from_tile_features(RabbitID, Block, RabbitFolder, feature_col,
 
         CZI_filepath = CSV_CZI_lookup(RabbitID, Block_str, img_number, ceph_base=ceph_base)
         czi_stem = os.path.splitext(os.path.basename(CZI_filepath))[0]
-        csv_path = os.path.join(analysis_dir, f'{czi_stem}_corrected_fullres-cellcount-tile224px.csv')
+        if feature_csv_dir is None:
+            csv_path = os.path.join(analysis_dir, f'{czi_stem}_corrected_fullres-cellcount-tile224px.csv')
+        else:
+            csv_path = os.path.join(feature_csv_dir, f'{czi_stem}_corrected_fullres_pred.csv')
         if not os.path.exists(csv_path):
-            print(f"  IMG{img_number} ({czi_stem}): no tile224px cellcount CSV yet -- skipping")
+            print(f"  IMG{img_number} ({czi_stem}): no feature CSV at {csv_path} -- skipping")
             continue
-        tile_lookup = load_tile_feature_lookup(csv_path, feature_col)
+        load_lookup = load_tile_feature_lookup if feature_csv_dir is None else load_tile_box_lookup
+        tile_lookups = {f: load_lookup(csv_path, f) for f in feature_cols}
+        # Every feature comes from the same CSV rows, so they share one tile index.
+        tile_lookup = tile_lookups[feature_cols[0]]
 
         q_lookup = None
         if need_predictions:
@@ -272,21 +290,19 @@ def build_b_and_Q_from_tile_features(RabbitID, Block, RabbitFolder, feature_col,
 
         log_bits = []
         for threshold in thresholds:
-            if threshold is None:
-                admitted_lookup = tile_lookup
-            else:
-                admitted_ids = q_lookup.index[q_lookup >= threshold]
-                admitted_lookup = tile_lookup[tile_lookup.index.isin(admitted_ids)]
+            admitted = (np.ones(len(tile_lookup), dtype=bool) if threshold is None
+                        else tile_lookup.index.isin(q_lookup.index[q_lookup >= threshold]))
+            for feature_col in feature_cols:
+                b_vals, b_weight = bilinear_tile_pull(x_full, y_full, tile_size,
+                                                      tile_lookups[feature_col][admitted])
+                b_native = b_vals.reshape(H_ds, W_ds).T[::4, ::4]
+                b_weight_native = b_weight.reshape(H_ds, W_ds).T[::4, ::4]
+                sx, sy = b_native.shape
 
-            b_vals, b_weight = bilinear_tile_pull(x_full, y_full, tile_size, admitted_lookup)
-            b_native = b_vals.reshape(H_ds, W_ds).T[::4, ::4]
-            b_weight_native = b_weight.reshape(H_ds, W_ds).T[::4, ::4]
-            sx, sy = b_native.shape
-
-            valid = b_weight_native > 0
-            arr_b, arr_Q = arrays[threshold]
-            arr_b[:sx, :sy, slice_num] = np.where(valid, b_native, 0.0)
-            arr_Q[:sx, :sy, slice_num] = np.where(valid, 1.0, 0.0)
+                valid = b_weight_native > 0
+                arr_b, arr_Q = arrays[(feature_col, threshold)]
+                arr_b[:sx, :sy, slice_num] = np.where(valid, b_native, 0.0)
+                arr_Q[:sx, :sy, slice_num] = np.where(valid, 1.0, 0.0)
             log_bits.append(f"{threshold_tag(threshold)} coverage={valid.mean():.1%}")
 
         elapsed = time.perf_counter() - t0
@@ -294,10 +310,10 @@ def build_b_and_Q_from_tile_features(RabbitID, Block, RabbitFolder, feature_col,
 
     results = {}
     flip = target_affine[0, 0] > 0 and target_affine[1, 1] > 0
-    for threshold, (b, Q) in arrays.items():
+    for key, (b, Q) in arrays.items():
         if flip:
             b, Q = b[::-1, ::-1, :], Q[::-1, ::-1, :]
-        results[threshold] = (b, Q, target_affine)
+        results[key] = (b, Q, target_affine)
 
     return results, corners, source_shape, source_affine
 
@@ -310,12 +326,12 @@ if __name__ == '__main__':
     THRESHOLDS = (None, 0.5, 0.7, 0.8, 0.9)  # None = no filtering (baseline); floats = P(clean) admission cutoff
 
     results, corners, source_shape, source_affine = build_b_and_Q_from_tile_features(
-        RabbitID, Block, RabbitFolder, FEATURE_COL, thresholds=THRESHOLDS)
+        RabbitID, Block, RabbitFolder, [FEATURE_COL], thresholds=THRESHOLDS)
 
     out_dir = str(Path(__file__).parent / 'TestData' / f'{RabbitID}_Block{Block:02d}_Tile224Features')
     os.makedirs(out_dir, exist_ok=True)
 
-    for threshold, (b, Q, target_affine) in results.items():
+    for (_, threshold), (b, Q, target_affine) in results.items():
         tag = threshold_tag(threshold)
 
         # run2: b-only, for a quick look at the retrained (18-slide) defect classifier's

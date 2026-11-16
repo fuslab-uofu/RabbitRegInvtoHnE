@@ -51,6 +51,19 @@ def load_source_geometry(RabbitID, Block, RabbitFolder, MovingStart='InVivo'):
     return moving_nib.shape[:3], moving_nib.affine
 
 
+def load_native_geometry(RabbitID, Block, RabbitFolder, MovingStart='InVivo'):
+    """Shape and affine of the same MR (source) file as load_source_geometry,
+    but in its raw on-disk orientation (no canonicalization) -- the
+    convention Day3End_Registered/ExtractMRFeatures.py already use. Used to
+    reorient a finished `a` (computed in load_source_geometry's canonical
+    space) back to this convention before saving, so it lands voxel-for-voxel
+    aligned with the rest of the MR pipeline with no reorientation needed on
+    the consumer side."""
+    paths = find_all_the_paths(RabbitID, Block, RabbitFolder, MovingStart)
+    moving_nib = nib.load(paths['Moving_FilePath'])
+    return moving_nib.shape[:3], moving_nib.affine
+
+
 def find_z_index(cropped_images_dir, img_number):
     """Position of IMG_{num:04d}_*.tiff in the sorted CroppedImages listing —
     this is exactly the ordering BlockFaceToNifti stacks into the Z axis."""

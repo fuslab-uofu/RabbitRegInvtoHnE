@@ -72,8 +72,8 @@ composed_label_path = os.path.join(voxel_maps_dir, f'voxel_tile_vol_ComposedRegT
 if USE_CELLCOUNT_FEATURE:
     print(f"Building b, Q from tile224 feature '{FEATURE_COL}' (defect threshold={DEFECT_THRESHOLD})...")
     tile224_results, _, _, _ = build_b_and_Q_from_tile_features(
-        RabbitID, Block, RabbitFolder, FEATURE_COL, thresholds=(DEFECT_THRESHOLD,))
-    b, Q, b_affine = tile224_results[DEFECT_THRESHOLD]
+        RabbitID, Block, RabbitFolder, [FEATURE_COL], thresholds=(DEFECT_THRESHOLD,))
+    b, Q, b_affine = tile224_results[(FEATURE_COL, DEFECT_THRESHOLD)]
     if b.shape != target_shape:
         raise ValueError(f"tile224 b shape {b.shape} != target_shape {target_shape} from load_moving_vox")
 else:

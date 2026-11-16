@@ -19,6 +19,7 @@ import shutil
 import tempfile
 import numpy as np
 import nibabel as nib
+from nibabel.processing import resample_from_to
 import SimpleITK as sitk
 from scipy.ndimage import map_coordinates
 import csv
@@ -103,6 +104,14 @@ TMAP_Z_THRESH       = 15  # robust (median/MAD) |z|-score cutoff on a coronal
                           # artifacts run |z|~50-18000, so 15 cleanly separates
                           # the two with margin on both sides.
 
+# T1 maps specifically (T2 maps look fine) also have widespread, milder
+# slab-edge artifacts -- degraded fits on the first/last slice of the
+# tissue-containing range -- too mild and inconsistent (sometimes a
+# near-zero clamp, sometimes an elevated-but-still-varying plane) to
+# reliably clear TMAP_Z_THRESH. Rather than chase that with a lower
+# threshold, unconditionally zero the outermost tissue-bearing slice on
+# each end for T1 maps, after the coronal-slice masking above.
+
 # ---------------------------------------------------------------------------
 # Normalization config
 # ---------------------------------------------------------------------------
@@ -113,6 +122,18 @@ SAVE_NORMALIZED = True
 NORM_METHOD     = 'percentile'  # 'percentile' | 'minmax' | 'zscore'
 NORM_CLIP_PCT   = 1.0
 NORM_OUT_RANGE  = (0.0, 1.0)
+
+# Set SAVE_NORMALIZED_METHOD2=True to also save a copy into Normalized_method2/:
+#   T1/T2 maps     -> fixed physical scale (ms / QUANT_MAP_SCALE), clipped to [0, 1]
+#   other contrasts -> ratio to the rabbit's healthy-muscle median, so healthy
+#                      muscle = 1 and background stays 0 (downstream treats 0 as
+#                      outside body/FOV). Dividing removes per-rabbit receiver
+#                      gain / coil-sensitivity scaling.
+# Healthy-muscle mask: hand-drawn in Slicer, one per rabbit, at
+# InVMRDataSets/HEALTHY_MUSCLE_MASK_NAME (any grid; resampled by affine).
+SAVE_NORMALIZED_METHOD2  = True
+QUANT_MAP_SCALE          = {'t1map': 3000.0, 't2map': 200.0}
+HEALTHY_MUSCLE_MASK_NAME = 'Healthy_Muscle_Annotation.nii.gz'
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +401,33 @@ def mask_bad_coronal_slices(path, z_thresh=TMAP_Z_THRESH, out_dir=None):
     return out_path
 
 
+def is_t1_map(path):
+    return 't1map' in os.path.basename(path).lower()
+
+
+def zero_edge_tissue_planes(path, out_dir=None):
+    """Zero the first and last coronal (axis 2) slice containing any nonzero
+    voxels. T1 map slab-edge slices have degraded fits too mild/inconsistent
+    to reliably clear flag_bad_coronal_slices' outlier threshold, so these
+    are stripped unconditionally instead of via the z-score test."""
+    img = nib.load(path)
+    arr = img.get_fdata(dtype=np.float32)
+    tissue_slices = np.where(np.any(arr != 0, axis=(0, 1)))[0]
+    if tissue_slices.size < 3:
+        return path
+
+    first, last = tissue_slices[0], tissue_slices[-1]
+    print(f"  [{os.path.basename(path)}] zeroing edge coronal slices {first} and {last}")
+    arr[:, :, first] = 0.0
+    arr[:, :, last] = 0.0
+
+    stem = os.path.basename(path).replace('.nii.gz', '')
+    out_dir = out_dir or tempfile.gettempdir()
+    out_path = os.path.join(out_dir, f'{stem}_edgezeroed.nii.gz')
+    nib.save(nib.Nifti1Image(arr, img.affine, img.header), out_path)
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Core: build dense Day3_end → Day0 displacement field
 # ---------------------------------------------------------------------------
@@ -495,8 +543,39 @@ def normalize_mr_array(arr, norm='percentile', clip_pct=1.0, out_range=(0.0, 1.0
     return a
 
 
-def save_registered(arr, stem, day3_end_nib, out_dir, norm_out_dir=None):
-    """Save the raw registered array, plus an optional normalized copy in norm_out_dir."""
+def load_healthy_muscle_mask(mask_path, day3_end_nib):
+    """Load the healthy-muscle label volume as a bool mask on the Day3_end grid.
+    Masks exported on a cropped grid are resampled (nearest neighbour, by affine)."""
+    mask_nib = nib.load(mask_path)
+    if mask_nib.shape != day3_end_nib.shape or not np.allclose(mask_nib.affine, day3_end_nib.affine):
+        mask_nib = resample_from_to(mask_nib, day3_end_nib, order=0)
+    mask = np.asarray(mask_nib.dataobj) > 0
+    print(f'  Healthy-muscle mask: {mask.sum():,} voxels ({mask_path})')
+    return mask
+
+
+def normalize_method2(arr, stem, muscle_mask):
+    """T1/T2 maps: divide by a fixed physical scale and clip to [0, 1].
+    Other contrasts: divide by the healthy-muscle median (nonzero voxels only),
+    so healthy muscle = 1 and zero background stays zero."""
+    a = np.nan_to_num(arr.astype(np.float32))
+    stem_lower = stem.lower()
+    for key, scale in QUANT_MAP_SCALE.items():
+        if key in stem_lower:
+            return np.clip(a / scale, 0.0, 1.0)
+
+    ref = a[muscle_mask & (a != 0)]
+    if ref.size == 0:
+        raise ValueError(f'{stem}: no nonzero voxels inside the healthy-muscle mask')
+    median = float(np.median(ref))
+    print(f'  [{stem}] healthy-muscle median = {median:.1f} (n={ref.size:,})')
+    return a / median
+
+
+def save_registered(arr, stem, day3_end_nib, out_dir, norm_out_dir=None,
+                    norm2_out_dir=None, muscle_mask=None):
+    """Save the raw registered array, plus optional normalized copies in
+    norm_out_dir (per-volume percentile) and norm2_out_dir (method 2)."""
     out = os.path.join(out_dir, f'{stem}_regToDay3End.nii.gz')
     nib.save(nib.Nifti1Image(arr.astype(np.float32), day3_end_nib.affine), out)
     print(f"  Saved → {out}")
@@ -505,6 +584,11 @@ def save_registered(arr, stem, day3_end_nib, out_dir, norm_out_dir=None):
         norm_out = os.path.join(norm_out_dir, f'{stem}_regToDay3End.nii.gz')
         nib.save(nib.Nifti1Image(norm_arr.astype(np.float32), day3_end_nib.affine), norm_out)
         print(f"  Saved normalized → {norm_out}")
+    if norm2_out_dir:
+        norm2_arr = normalize_method2(arr, stem, muscle_mask)
+        norm2_out = os.path.join(norm2_out_dir, f'{stem}_regToDay3End.nii.gz')
+        nib.save(nib.Nifti1Image(norm2_arr.astype(np.float32), day3_end_nib.affine), norm2_out)
+        print(f"  Saved normalized (method 2) → {norm2_out}")
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +622,9 @@ def run_for_rabbit(rabbit_id):
     NORM_OUT_DIR = os.path.join(OUT_DIR, 'Normalized')
     if SAVE_NORMALIZED:
         os.makedirs(NORM_OUT_DIR, exist_ok=True)
+    NORM2_OUT_DIR = os.path.join(OUT_DIR, 'Normalized_method2')
+    if SAVE_NORMALIZED_METHOD2:
+        os.makedirs(NORM2_OUT_DIR, exist_ok=True)
 
     _day3 = _load_day3_log(DAY3_DIR, rabbit_id)
     DAY3_END_PATH     = _day3['End'][0]
@@ -562,6 +649,13 @@ def run_for_rabbit(rabbit_id):
     print(f'Loading {os.path.basename(SLICER_TRANSFORM_PATH)}...')
     slicer_transform = _load_transform(SLICER_TRANSFORM_PATH)
 
+    # Normalized-copy settings shared by every save_registered() call below
+    norm_kwargs = {'norm_out_dir': NORM_OUT_DIR if SAVE_NORMALIZED else None}
+    if SAVE_NORMALIZED_METHOD2:
+        norm_kwargs['norm2_out_dir'] = NORM2_OUT_DIR
+        norm_kwargs['muscle_mask'] = load_healthy_muscle_mask(
+            os.path.join(_base, HEALTHY_MUSCLE_MASK_NAME), day3_end_nib)
+
     # --- Build body mask from Day3_end structural ---
     if APPLY_MASK:
         day3_end_arr = day3_end_nib.get_fdata(dtype=np.float32)
@@ -580,8 +674,7 @@ def run_for_rabbit(rabbit_id):
     # every other volume so it's available for cross-contrast comparison) ---
     day3_end_stem = os.path.basename(DAY3_END_PATH).replace('.nii.gz', '')
     end_arr = day3_end_arr * mask if APPLY_MASK else day3_end_arr
-    save_registered(end_arr, day3_end_stem, day3_end_nib, OUT_DIR,
-                     norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
+    save_registered(end_arr, day3_end_stem, day3_end_nib, OUT_DIR, **norm_kwargs)
     del day3_end_arr, end_arr
 
     # --- Day3_start extras → Day3_end (Slicer only) ---
@@ -597,6 +690,8 @@ def run_for_rabbit(rabbit_id):
         resample_path = path
         if MASK_TMAP_ARTIFACTS and is_t_map(path):
             resample_path = mask_bad_coronal_slices(path)
+            if is_t1_map(path):
+                resample_path = zero_edge_tissue_planes(resample_path)
         print(f"Resampling {stem} → Day3_end ...")
         _interp = {0: sitk.sitkNearestNeighbor, 1: sitk.sitkLinear}[INTERP_ORDER]
         arr = ApplySlicerTransform(resample_path, INVIVO_REF_PATH, SLICER_TRANSFORM_PATH, interpolator=_interp)
@@ -607,8 +702,7 @@ def run_for_rabbit(rabbit_id):
 
         if APPLY_MASK:
             arr = arr * mask
-        save_registered(arr, stem, day3_end_nib, OUT_DIR,
-                         norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
+        save_registered(arr, stem, day3_end_nib, OUT_DIR, **norm_kwargs)
 
     # --- End_native volumes → Day3_end grid (identity resample only) ---
     day3_end_sitk = sitk.ReadImage(INVIVO_REF_PATH)
@@ -621,12 +715,13 @@ def run_for_rabbit(rabbit_id):
         resample_path = path
         if MASK_TMAP_ARTIFACTS and is_t_map(path):
             resample_path = mask_bad_coronal_slices(path)
+            if is_t1_map(path):
+                resample_path = zero_edge_tissue_planes(resample_path)
         print(f"Resampling {stem} → Day3_end grid (no transform) ...")
         arr = resample_to_grid(resample_path, day3_end_sitk, interpolator=_interp)
         if APPLY_MASK:
             arr = arr * mask
-        save_registered(arr, stem, day3_end_nib, OUT_DIR,
-                         norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
+        save_registered(arr, stem, day3_end_nib, OUT_DIR, **norm_kwargs)
 
     if RUN_DAY0:
         # --- Build / load Day3_end → Day0 displacement field ---
@@ -655,8 +750,7 @@ def run_for_rabbit(rabbit_id):
             arr     = resample_with_field(vol_arr, voxel_field, order=INTERP_ORDER)
             if APPLY_MASK:
                 arr = arr * mask
-            save_registered(arr, stem, day3_end_nib, OUT_DIR,
-                             norm_out_dir=NORM_OUT_DIR if SAVE_NORMALIZED else None)
+            save_registered(arr, stem, day3_end_nib, OUT_DIR, **norm_kwargs)
     else:
         print("RUN_DAY0=False -- skipping Day0 displacement field and resampling.")
 

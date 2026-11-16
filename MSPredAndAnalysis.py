@@ -1,120 +1,105 @@
-# Multi-stage MR -> H&E prediction: evaluation plan
-#
-# Predicts the analysis plan's shared H&E-derived targets (tissue class,
-# stain intensity / cell density, tissue proportions) from progressively
-# richer MR feature-extraction strategies (Stage 0 baseline voxel intensities
-# through Stage 4 from-scratch CNNs), reusing MultiRabAnalysis.py's
-# rabbit/slide-holdout CV harness, build_model, and plotting helpers (import
-# them rather than duplicating, they're already generic over
-# predictor_names/target_names).
-#
-# Cross-stage comparability: stages operate at different native spatial
-# resolutions -- Stage 0/1 predict per MR voxel (0.5mm), Stage 2's RadioDino
-# patch embeddings predict per 16px patch (8mm, 224px tile / 14x14 patch
-# grid). Scoring each stage against a target at its own native resolution is
-# NOT a fair cross-stage comparison: aggregating a target over a coarser
-# window (e.g. mean over a patch's voxels) shrinks the target's own variance
-# (partly by averaging out registration-error noise), which mechanically
-# inflates R² regardless of whether a stage's features actually carry more
-# signal. Fix: for the cross-stage comparison numbers, mean-pool every
-# stage's per-voxel predictions up to the coarsest shared grid (currently the
-# patch grid) and score all stages against the same patch-level H&E target.
-# Each stage's native-resolution metric can still be reported separately as
-# a diagnostic, just not used for cross-stage comparison.
-#
-# Patch coverage filtering happens AFTER embedding extraction, not before:
-# the ViT's self-attention mixes information across the whole 224x224 tile
-# to produce each patch's embedding, so a patch can't be dropped
-# pre-extraction without corrupting its neighbors' embeddings too -- the
-# model needs the full (possibly zero-padded, since tile_size can exceed the
-# real FOV) tile as context regardless of which individual patches end up
-# usable. So: flatten ExtractMRFeatures.py's per-tile (14,14,768) embedding
-# grid to (196,768) rows, then drop rows whose corresponding H&E/MR
-# sub-region lacks real coverage -- reusing the same two coverage
-# conventions ExtractMRFeatures.py already applies at the tile level
-# (valid_mask's NaN-only check for H&E, the nonzero-fraction check for MR;
-# see filter_tiles_by_he_coverage / filter_tiles_by_mr_coverage), just
-# computed per patch's 16x16 sub-region instead of per whole tile.
-#
-# Each flattened, coverage-filtered patch row also needs real-world/pixel
-# coordinates (patch (i,j) within a tile -> pixel (x,y) in the slice) so it
-# can be matched against the correct H&E sub-region target -- not yet
-# computed anywhere; needs a patch-level analog of build_tiles'
-# tile_centers()/compute_grid_shape().
+# MR -> H&E analysis: per-block feature/target correlations, plus leave-one-rabbit-out (LORO)
+# or leave-one-block-out (LOBO) regression over Stage 0 (raw MR) and Stage 0+1a (raw + derived)
+# predictors.
 
 import os
+import re
 from collections import namedtuple
+from pathlib import Path
+import nibabel as nib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from scipy.stats import pearsonr, spearmanr
+from sklearn.decomposition import PCA
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-
+from sklearn.preprocessing import StandardScaler
 from MultiRabAnalysis import build_model
+from PullMRFeaturesByVoxel import mr_grid_reference
+from RabbitPathFinder import (block_analysis_dir, block_label, class_fraction_col, day3end_mr_dir,
+                              load_ready_rabbit_blocks, mr_norm_csv_suffix, rabbit_data_dir)
 
-RabbitTable = namedtuple('RabbitTable', ['rabbit_id', 'predictor_names', 'mr_features', 'target', 'voxel_id'])
+# One analysed rabbit block's rows; a rabbit with several analysed blocks has one table per block.
+# targets = {column: values} for every target column loaded; target = the one in use (select_target).
+RabbitTable = namedtuple('RabbitTable', ['rabbit_id', 'block_num', 'predictor_names', 'mr_features', 'target',
+                                         'vx', 'vy', 'vz', 'targets'], defaults=[None])
+
+
+def table_label(t):
+    """'R23-055 Block05': the block a table's rows come from."""
+    return block_label(t.rabbit_id, t.block_num)
 
 
 def valid_row_mask(mr_features, target):
-    """Finite predictors and target -- no zero-exclusion, unlike
-    MultiRabAnalysis.valid_voxel_mask. extract_voxelwise_features already
-    enforces 'every raw MR contrast nonzero' at extraction time (its own
-    mask_volumes check), so every row already in voxel_features_by_id.csv
-    satisfies that; re-checking it here would only wrongly catch Stage 1a
-    derived columns' legitimate zero values (flat-region gradient magnitude,
-    a locally uniform neighborhood's std)."""
+    """Rows with finite predictors and target. No zero check: extraction already dropped
+    zero-MR voxels, and derived features (gradient, std) can legitimately be 0."""
     return np.isfinite(np.hstack([mr_features, target[:, None]])).all(axis=1)
 
 
-def load_rabbit_table(rabbit_id, block_num, base_dir, csv_name, feature_col):
-    """One rabbit's Stage 0/1a voxel table -- no slide dimension (unlike
-    MultiRabAnalysis.py's Rabbit/Slide), since ExtractMRFeatures.py already
-    writes one row per voxel-ID across the whole rabbit/block. Every column
-    except voxel_id and feature_col is treated as an MR predictor generically
-    -- this doesn't hardcode contrast names, so it works whether or not
-    rename_to_standardized_mr_columns has been applied upstream (it just
-    changes what predictor_names ends up containing)."""
-    path = os.path.join(base_dir, f'R{rabbit_id}', 'Analysis', f'Block{block_num:02d}', csv_name)
+def load_rabbit_table(rabbit_id, block_num, base_dir, csv_name, target_cols,
+                      min_he_coverage=None, min_mr_coverage=None):
+    """Load one rabbit block's table (one row per voxel, tile or patch, from ExtractMRFeatures.py).
+    Every column except vx/vy/vz, the target_cols and the '*_coverage_frac' columns is an MR
+    predictor. target starts as target_cols[0]; select_target switches it. Tile/patch rows below
+    min_he_coverage, or below min_mr_coverage in any contrast, are dropped."""
+    name = block_label(rabbit_id, block_num)
+    path = os.path.join(block_analysis_dir(base_dir, rabbit_id, block_num), csv_name)
     if not os.path.exists(path):
-        print(f"No {csv_name} for rabbit {rabbit_id}, skipping.")
+        print(f"No {csv_name} for {name}, skipping.")
         return None
     df = pd.read_csv(path)
-    predictor_names = np.array([c for c in df.columns if c not in ('voxel_id', feature_col)])
+    coverage_cols = [c for c in df.columns if c.endswith('_coverage_frac')]
+    n_rows = len(df)
+    if min_he_coverage is not None:
+        df = df[df['he_coverage_frac'] >= min_he_coverage]
+    if min_mr_coverage is not None:
+        mr_coverage_cols = [c for c in coverage_cols if c != 'he_coverage_frac']
+        df = df[(df[mr_coverage_cols] >= min_mr_coverage).all(axis=1)]
+    if len(df) < n_rows:
+        print(f"{name}: {len(df):,}/{n_rows:,} row(s) kept at coverage thresholds "
+              f"H&E {min_he_coverage}, MR {min_mr_coverage}")
+    predictor_names = np.array([c for c in df.columns
+                                if c not in ('vx', 'vy', 'vz', *target_cols, *coverage_cols)])
+    targets = {col: df[col].to_numpy(dtype=float) for col in target_cols}
     return RabbitTable(
         rabbit_id=rabbit_id,
+        block_num=block_num,
         predictor_names=predictor_names,
         mr_features=df[predictor_names].to_numpy(dtype=float),
-        target=df[feature_col].to_numpy(dtype=float),
-        voxel_id=df['voxel_id'].to_numpy(),
+        target=targets[target_cols[0]],
+        vx=df['vx'].to_numpy(),
+        vy=df['vy'].to_numpy(),
+        vz=df['vz'].to_numpy(),
+        targets=targets,
     )
 
 
+def select_target(tables, target_col):
+    """tables with target_col (one of the columns load_rabbit_table loaded) as the target."""
+    return [t._replace(target=t.targets[target_col]) for t in tables]
+
+
 def predictor_standardization(tables):
-    """{rabbit_id: predictor_names} -> common/varying report, same
-    common-column-intersection pattern as MultiRabAnalysis.feature_standardization,
-    applied to predictor names instead of hne_names/mr_names."""
-    name_sets = {t.rabbit_id: set(t.predictor_names) for t in tables}
+    """Return the predictor names shared by every block; print any that vary."""
+    name_sets = {table_label(t): set(t.predictor_names) for t in tables}
     common = set.intersection(*name_sets.values())
     union = set.union(*name_sets.values())
     varying = union - common
 
-    print(f"{len(common)} predictor(s) common to all {len(tables)} rabbit(s)")
+    print(f"{len(common)} predictor(s) common to all {len(tables)} block(s)")
     if varying:
-        print(f"{len(varying)} predictor(s) vary across rabbits:")
-        for rabbit_id, names in name_sets.items():
+        print(f"{len(varying)} predictor(s) vary across blocks:")
+        for label, names in name_sets.items():
             missing = union - names
             if missing:
-                print(f"  Rabbit {rabbit_id} missing: {sorted(missing)}")
+                print(f"  {label} missing: {sorted(missing)}")
     return common
 
 
 def restrict_tables_to_common_predictors(tables, common):
-    """Restrict every table's predictor columns down to `common`, in one
-    fixed sorted order shared across all rabbits -- required before vstack-ing
-    tables together in rabbit_holdout_folds, since raw column order isn't
-    guaranteed to match across rabbits even after standardization (confirmed:
-    R23-055's header orders T1w CE Day 3 before T2w Day 3, R24-240's is the
-    reverse)."""
+    """Keep only `common` predictors, in one sorted order for all blocks (CSV column
+    order differs between rabbits, so this is required before stacking them)."""
     order = np.array(sorted(common))
     restricted = []
     for t in tables:
@@ -124,56 +109,176 @@ def restrict_tables_to_common_predictors(tables, common):
 
 
 def classify_predictor_stage(name):
-    """'stage1a' for a derived-feature column ('_grad_'/'_nbhd_' --
-    ExtractMRFeatures.py's gradient_extra_volumes/neighborhood_extra_volumes
-    naming), else 'stage0' (a raw MR contrast column)."""
-    return 'stage1a' if ('_grad_' in name or '_nbhd_' in name) else 'stage0'
+    """'stage1a' for derived columns ('_grad_'/'_nbhd_' in the name), 'stage1b' for tile
+    radiomics ('_rad_'), 'stage2' for embedding dimensions ('_emb'), else 'stage0' (raw MR
+    intensity, or a tile/patch's mean of it)."""
+    if '_grad_' in name or '_nbhd_' in name:
+        return 'stage1a'
+    if '_rad_' in name:
+        return 'stage1b'
+    if '_emb' in name:
+        return 'stage2'
+    return 'stage0'
+
+
+# Predictor classes each stage selection keeps (the '0_' selections are additive).
+STAGE_SELECTIONS = {
+    'stage0': {'stage0'},
+    'stage0_1a': {'stage0', 'stage1a'},
+    'stage1b': {'stage1b'},
+    'stage0_1b': {'stage0', 'stage1b'},
+    'stage2': {'stage2'},
+    'stage0_2': {'stage0', 'stage2'},
+}
 
 
 def select_stage_predictors(tables, stage):
-    """Restrict every table's predictors down to one stage's columns.
-    'stage0' = raw MR contrasts only, the baseline. 'stage0_1a' = everything
-    (Stage 0 raw + Stage 1a derived) -- Stage 1a's gradient/neighborhood-stat
-    columns are computed FROM the Stage 0 contrasts, so this is additive
-    (progressively richer, matching this file's header comment), not Stage
-    1a's derived columns in isolation. Radius/axis-type sub-splits within
-    Stage 1a (e.g. 2D-only vs 3D-only, or by radius) are a natural later
-    extension of this same function, not built yet."""
-    if stage == 'stage0':
-        keep = lambda n: classify_predictor_stage(n) == 'stage0'
-    elif stage == 'stage0_1a':
-        keep = lambda n: True
-    else:
-        raise ValueError(f"Unknown stage: {stage!r}, expected 'stage0'/'stage0_1a'")
+    """Keep one STAGE_SELECTIONS entry's predictors, e.g. 'stage0' = raw MR intensity only,
+    'stage0_1a' = raw + derived, 'stage0_2' = raw + embeddings."""
+    if stage not in STAGE_SELECTIONS:
+        raise ValueError(f"Unknown stage: {stage!r}, expected one of {sorted(STAGE_SELECTIONS)}")
+    kept_classes = STAGE_SELECTIONS[stage]
 
     restricted = []
     for t in tables:
-        idx = [i for i, n in enumerate(t.predictor_names) if keep(n)]
+        idx = [i for i, n in enumerate(t.predictor_names) if classify_predictor_stage(n) in kept_classes]
         restricted.append(t._replace(predictor_names=t.predictor_names[idx], mr_features=t.mr_features[:, idx]))
     return restricted
 
 
-def rabbit_holdout_folds(tables):
-    """One fold per rabbit: train on every other rabbit's voxels pooled
-    together, test on the held-out rabbit's voxels. Simpler than
-    MultiRabAnalysis.rabbit_holdout_folds since there's no per-slide pooling
-    step -- each table already IS one rabbit's full voxel set."""
-    folds = []
-    for i, held_out in enumerate(tables):
-        train_parts = [t for j, t in enumerate(tables) if j != i]
-        train_mr = np.vstack([t.mr_features for t in train_parts])
-        train_target = np.concatenate([t.target for t in train_parts])
-        folds.append((held_out.rabbit_id, train_mr, train_target, held_out.mr_features, held_out.target))
-    return folds
+def split_predictor_name(name):
+    """'T1w CE Day 3_nbhd_mean_3d_r3' -> ('T1w CE Day 3', 'nbhd_mean_3d_r3');
+    'T1w CE Day 3_rad_glcm_Contrast' -> ('T1w CE Day 3', 'rad_glcm_Contrast');
+    a raw contrast column -> (name, 'raw')."""
+    for marker in ('_grad_', '_nbhd_', '_rad_'):
+        if marker in name:
+            i = name.index(marker)
+            return name[:i], name[i + 1:]
+    return name, 'raw'
+
+
+VARIANT_FAMILY_ORDER = ['raw', 'nbhd_mean', 'nbhd_std', 'grad', 'rad']
+
+
+def variant_sort_key(variant):
+    """Table row order: raw, nbhd_mean, nbhd_std (2d before 3d, increasing radius), grad."""
+    family = next(f for f in VARIANT_FAMILY_ORDER if variant.startswith(f))
+    m = re.search(r'_(2d|3d)_r(\d+)$', variant)
+    return (VARIANT_FAMILY_ORDER.index(family),
+            m.group(1) if m else '', int(m.group(2)) if m else 0, variant)
+
+
+def per_block_correlations(tables):
+    """One row per (block, predictor): Pearson r and Spearman rho vs the H&E target,
+    computed within each block (no model, no pooling across blocks). 'unit' names the block."""
+    rows = []
+    for t in tables:
+        for k, name in enumerate(t.predictor_names):
+            x = t.mr_features[:, k]
+            ok = valid_row_mask(x[:, None], t.target)
+            contrast, variant = split_predictor_name(name)
+            rows.append({
+                'rabbit': t.rabbit_id, 'block': t.block_num, 'unit': table_label(t),
+                'predictor': name, 'contrast': contrast, 'variant': variant,
+                'stage': classify_predictor_stage(name), 'n': int(ok.sum()),
+                'pearson_r': pearsonr(x[ok], t.target[ok])[0],
+                'spearman_rho': spearmanr(x[ok], t.target[ok])[0],
+            })
+    return pd.DataFrame(rows)
+
+
+def print_correlation_tables(corr, value='spearman_rho', top_n=25):
+    """Print one table per contrast (variants x blocks, + mean and n_pos = #blocks > 0),
+    then the top_n predictors by |mean|. value: 'spearman_rho' or 'pearson_r'."""
+    unit_order = list(dict.fromkeys(corr['unit']))
+    n_units = len(unit_order)
+    label = METRIC_LABELS.get(value, value)
+
+    with pd.option_context('display.width', 200, 'display.max_rows', 500):
+        for contrast in sorted(corr['contrast'].unique()):
+            sub = corr[corr['contrast'] == contrast]
+            table = sub.pivot(index='variant', columns='unit', values=value)[unit_order]
+            table = table.loc[sorted(table.index, key=variant_sort_key)]
+            table['mean'] = table[unit_order].mean(axis=1)
+            table['n_pos'] = (table[unit_order] > 0).sum(axis=1)
+            print(f"\n=== {label} vs H&E target: {contrast} (n_pos = #blocks > 0, of {n_units}) ===")
+            print(table.round(3))
+
+        wide = corr.pivot(index='predictor', columns='unit', values=value)[unit_order]
+        summary = pd.DataFrame({
+            'stage': [classify_predictor_stage(n) for n in wide.index],
+            'mean': wide.mean(axis=1),
+            'min': wide.min(axis=1),
+            'max': wide.max(axis=1),
+            'n_pos': (wide > 0).sum(axis=1),
+        }, index=wide.index)
+        summary = summary.reindex(summary['mean'].abs().sort_values(ascending=False).index)
+        print(f"\n=== Top {top_n} predictors by |mean {label}| across blocks ===")
+        print(summary.round(3).head(top_n))
+
+
+def pooled_feature_pca(tables, n_components=10):
+    """Pooled PCA of the standardized MR features over every block's valid voxels. Returns
+    (scores: one row per voxel with rabbit, block, vx/vy/vz, target and PC columns; loadings: one row
+    per predictor; explained: variance fraction per PC)."""
+    masks = [valid_row_mask(t.mr_features, t.target) for t in tables]
+    features = np.vstack([t.mr_features[m] for t, m in zip(tables, masks)])
+    pca = PCA(n_components=n_components)
+    pc_scores = pca.fit_transform(StandardScaler().fit_transform(features))
+    components = pca.components_.copy()
+    # PCA signs are arbitrary: orient PC1 so that it increases with T1w CE intensity.
+    if components[0, list(tables[0].predictor_names).index('T1w CE Day 3')] < 0:
+        pc_scores[:, 0] *= -1
+        components[0] *= -1
+
+    pc_names = [f'PC{k + 1}' for k in range(n_components)]
+    scores = pd.DataFrame(pc_scores, columns=pc_names)
+    scores.insert(0, 'target', np.concatenate([t.target[m] for t, m in zip(tables, masks)]))
+    for axis in ('vz', 'vy', 'vx'):
+        scores.insert(0, axis, np.concatenate([getattr(t, axis)[m] for t, m in zip(tables, masks)]))
+    scores.insert(0, 'block', np.concatenate([np.full(m.sum(), t.block_num) for t, m in zip(tables, masks)]))
+    scores.insert(0, 'rabbit', np.concatenate([np.full(m.sum(), t.rabbit_id) for t, m in zip(tables, masks)]))
+    loadings = pd.DataFrame(components.T, index=tables[0].predictor_names, columns=pc_names)
+    explained = pd.Series(pca.explained_variance_ratio_, index=pc_names, name='explained_variance_ratio')
+    return scores, loadings, explained
+
+
+# What one cross-validation fold holds out, named per table: 'loro' = a whole rabbit (all of
+# its blocks together, so no block of the test rabbit is trained on), 'lobo' = one block.
+CV_HOLDOUT_UNITS = {
+    'loro': lambda t: f'R{t.rabbit_id}',
+    'lobo': table_label,
+}
+
+
+def holdout_folds(tables, cv_mode='loro'):
+    """One fold per held-out unit of cv_mode (see CV_HOLDOUT_UNITS): train on every other
+    table's rows pooled, test on the held-out tables' rows stacked. Yields (held-out name,
+    held-out tables, train_mr, train_target, test_mr, test_target) one fold at a time, so
+    only one fold's training matrix is in memory."""
+    if cv_mode not in CV_HOLDOUT_UNITS:
+        raise ValueError(f"Unknown cv_mode: {cv_mode!r}, expected one of {sorted(CV_HOLDOUT_UNITS)}")
+    unit_of = CV_HOLDOUT_UNITS[cv_mode]
+    for unit in dict.fromkeys(unit_of(t) for t in tables):
+        held_out = [t for t in tables if unit_of(t) == unit]
+        train_parts = [t for t in tables if unit_of(t) != unit]
+        yield (unit, held_out,
+               np.vstack([t.mr_features for t in train_parts]),
+               np.concatenate([t.target for t in train_parts]),
+               np.vstack([t.mr_features for t in held_out]),
+               np.concatenate([t.target for t in held_out]))
+
+
+def split_predictions_by_table(tables, test_mask, y_pred):
+    """Undo a fold's row stacking: per held-out table, (its rows' test mask, its predictions)."""
+    masks = np.split(test_mask, np.cumsum([len(t.target) for t in tables])[:-1])
+    preds = np.split(y_pred, np.cumsum([m.sum() for m in masks])[:-1])
+    return list(zip(masks, preds))
 
 
 def regression_metrics(y_true, y_pred):
-    """R² (can go negative -- worse than predicting the mean; a real
-    miscalibration signal Pearson/Spearman would hide), RMSE, MAE, and both
-    Pearson r (linear association) and Spearman rho (monotonic association,
-    robust to the outlier-prone texture/radiomics ratio features elsewhere in
-    this pipeline) -- deliberately not just one correlation metric, since
-    they answer different questions about the same prediction."""
+    """R², RMSE, MAE, Pearson r, Spearman rho. R² < 0 means worse than predicting the
+    mean (miscalibration that r/rho alone would hide)."""
     pearson_r, _ = pearsonr(y_true, y_pred)
     spearman_rho, _ = spearmanr(y_true, y_pred)
     return {
@@ -185,52 +290,149 @@ def regression_metrics(y_true, y_pred):
     }
 
 
-def run_model_comparison(folds, model_types):
-    """Fits each model_type against the same LORO folds. Returns
-    {model_type: {'per_fold': [(rabbit_id, metrics_dict), ...], 'pooled': metrics_dict}}
-    -- 'pooled' concatenates every fold's held-out (y_true, y_pred) before
-    scoring, i.e. one number over every rabbit's out-of-fold voxels at once,
-    matching the sketch's single 'Overall' marker per model."""
-    results = {}
-    for model_type in model_types:
-        per_fold = []
-        all_true, all_pred = [], []
-        for rabbit_id, train_mr, train_target, test_mr, test_target in folds:
-            train_mask = valid_row_mask(train_mr, train_target)
-            test_mask = valid_row_mask(test_mr, test_target)
-            X_train, y_train = train_mr[train_mask], train_target[train_mask]
-            X_test, y_test = test_mr[test_mask], test_target[test_mask]
+def run_model_comparison(folds, model_types, model_builder=build_model):
+    """Fit each model type on the same holdout_folds -> {model: {'per_fold': [(held-out name,
+    metrics)], 'pooled': metrics, 'predictions': {(rabbit_id, block_num): (test row mask,
+    held-out prediction)}}}; 'pooled' scores all held-out voxels together.
+    model_builder(model_type) -> unfit regressor."""
+    results = {model_type: {'per_fold': [], 'predictions': {}} for model_type in model_types}
+    all_true = {model_type: [] for model_type in model_types}
+    all_pred = {model_type: [] for model_type in model_types}
+    for held_out_name, held_out_tables, train_mr, train_target, test_mr, test_target in folds:
+        train_mask = valid_row_mask(train_mr, train_target)
+        test_mask = valid_row_mask(test_mr, test_target)
+        X_train, y_train = train_mr[train_mask], train_target[train_mask]
+        X_test, y_test = test_mr[test_mask], test_target[test_mask]
 
-            model = build_model(model_type)
+        for model_type in model_types:
+            model = model_builder(model_type)
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
 
             metrics = regression_metrics(y_test, y_pred)
-            per_fold.append((rabbit_id, metrics))
-            all_true.append(y_test)
-            all_pred.append(y_pred)
-            print(f"[{model_type}] held out Rabbit {rabbit_id}: n={len(y_test)}  "
+            results[model_type]['per_fold'].append((held_out_name, metrics))
+            for t, prediction in zip(held_out_tables,
+                                     split_predictions_by_table(held_out_tables, test_mask, y_pred)):
+                results[model_type]['predictions'][(t.rabbit_id, t.block_num)] = prediction
+            all_true[model_type].append(y_test)
+            all_pred[model_type].append(y_pred)
+            print(f"[{model_type}] held out {held_out_name}: n={len(y_test)}  "
                   f"R²={metrics['r2']:.3f}  RMSE={metrics['rmse']:.4f}  MAE={metrics['mae']:.4f}  "
                   f"r={metrics['pearson_r']:.3f}  ρ={metrics['spearman_rho']:.3f}")
 
-        pooled = regression_metrics(np.concatenate(all_true), np.concatenate(all_pred))
-        print(f"[{model_type}] pooled (all rabbits' held-out voxels): "
+    for model_type in model_types:
+        pooled = regression_metrics(np.concatenate(all_true[model_type]),
+                                    np.concatenate(all_pred[model_type]))
+        print(f"[{model_type}] pooled (every fold's held-out voxels): "
               f"R²={pooled['r2']:.3f}  RMSE={pooled['rmse']:.4f}  MAE={pooled['mae']:.4f}  "
               f"r={pooled['pearson_r']:.3f}  ρ={pooled['spearman_rho']:.3f}")
-        results[model_type] = {'per_fold': per_fold, 'pooled': pooled}
+        results[model_type]['pooled'] = pooled
     return results
+
+
+def results_to_frame(results, stage):
+    """Flatten run_model_comparison output to one row per (model, held-out rabbit or block),
+    plus a 'pooled' row per model, with one column per metric."""
+    rows = []
+    for model_type, r in results.items():
+        for held_out_name, metrics in r['per_fold'] + [('pooled', r['pooled'])]:
+            rows.append({'stage': stage, 'model': model_type, 'held_out': held_out_name, **metrics})
+    return pd.DataFrame(rows)
+
+
+def save_prediction_volumes(tables, results, stage, base_dir, mr_norm_dir, out_dir, cv_mode='loro'):
+    """Write each model's held-out prediction for every block to out_dir as a NIfTI on that
+    rabbit's MR grid (the grid the feature tables index; NaN where there is no prediction),
+    for viewing in Slicer over the MR volumes read from mr_norm_dir."""
+    for t in tables:
+        prefix = f'R{t.rabbit_id}_Block{t.block_num:02d}'
+        target = mr_grid_reference(day3end_mr_dir(base_dir, t.rabbit_id, mr_norm_dir))
+        for model_type, r in results.items():
+            test_mask, y_pred = r['predictions'][(t.rabbit_id, t.block_num)]
+            volume = np.full(target.shape, np.nan, dtype=np.float32)
+            # CSV coordinates are (axis0, axis2, axis1) indices, see extract_voxelwise_features.
+            volume[t.vx[test_mask], t.vz[test_mask], t.vy[test_mask]] = y_pred
+            out_path = os.path.join(out_dir, f'{prefix}_{cv_mode.upper()}pred_{stage}_{model_type}.nii.gz')
+            nib.save(nib.Nifti1Image(volume, target.affine), out_path)
+            print(f"Saved {out_path}")
+
+
+def voxel_class_labels(vx, vy, vz, label_path, target_grid_path):
+    """Class label at each table row's voxel, from a label NIfTI (e.g.
+    ProjectClassPredictionsToMR.py's output). Table coordinates index the rabbit's H&E target
+    (target_grid_path, its *_RL_iter1.nii.gz); each voxel is found in the label map through
+    world coordinates, since the two can be the same grid stored in a different axis order
+    (e.g. canonical RAS labels vs the raw-orientation target). Stops if a voxel doesn't land
+    exactly on a label voxel, i.e. the grids really differ."""
+    labels = nib.load(str(label_path))
+    target = nib.load(str(target_grid_path))
+    # CSV coordinates are (axis0, axis2, axis1) indices, see extract_voxelwise_features.
+    target_idx = np.stack([vx, vz, vy, np.ones(len(vx))]).astype(float)
+    label_idx = (np.linalg.inv(labels.affine) @ target.affine @ target_idx)[:3]
+    rounded = np.round(label_idx).astype(np.int64)
+    on_grid = np.allclose(label_idx, rounded, atol=1e-3)
+    in_bounds = all(((rounded[a] >= 0) & (rounded[a] < labels.shape[a])).all() for a in range(3))
+    if not (on_grid and in_bounds):
+        raise ValueError(f"Label map grid {labels.shape} isn't the H&E target grid {target.shape} "
+                         f"(voxels don't line up):\n  {label_path}\n  {target_grid_path}")
+    return np.asanyarray(labels.dataobj)[rounded[0], rounded[1], rounded[2]]
+
+
+def class_fraction_tables(tables, class_name, label_source, base_dir):
+    """tables with each row's target replaced by its voxel's fraction of class_name, read from
+    ProjectClassPredictionsToMR.py's MR-grid map for label_source (NaN where no H&E covers the
+    voxel; those rows are dropped by valid_row_mask)."""
+    out = []
+    for t in tables:
+        prefix = f'R{t.rabbit_id}_Block{t.block_num:02d}'
+        fraction_path = (Path(__file__).parent / 'TestData' / f'{prefix}_ClassPredictions_{label_source}'
+                         / f'{prefix}_MR_{class_name}_fraction.nii.gz')
+        target_grid_path = os.path.join(block_analysis_dir(base_dir, t.rabbit_id, t.block_num),
+                                        f'{prefix}_RL_iter1.nii.gz')
+        fraction = voxel_class_labels(t.vx, t.vy, t.vz, fraction_path, target_grid_path)
+        out.append(t._replace(target=np.asarray(fraction, dtype=float)))
+    return out
 
 
 METRIC_LABELS = {'r2': 'R²', 'rmse': 'RMSE', 'mae': 'MAE', 'pearson_r': 'Pearson r', 'spearman_rho': 'Spearman ρ'}
 
+# Rabbit labels shown on figures. Add new rabbits at the end so existing numbers never change.
+RABBIT_DISPLAY_NAMES = {"23-055": "Rabbit 1", "24-103": "Rabbit 2", "24-240": "Rabbit 3", "24-082": "Rabbit 4",
+                        "24-101": "Rabbit 5", "24-058": "Rabbit 6", "24-064": "Rabbit 7", "24-104": "Rabbit 8"}
 
-def plot_metric_comparison(results, model_types, metric_names, stage_label=None):
-    """One panel per metric: x-axis = model type, one colored dot per rabbit
-    (that rabbit's held-out-fold value) plus one larger black 'Overall' dot
-    (the pooled value) -- per Jesse's sketch."""
-    rabbit_ids = sorted({rid for r in results.values() for rid, _ in r['per_fold']})
-    colors = plt.cm.tab10(np.linspace(0, 1, len(rabbit_ids)))
-    rabbit_color = dict(zip(rabbit_ids, colors))
+
+def unit_display_names(corr):
+    """{corr 'unit': figure label}: the rabbit's RABBIT_DISPLAY_NAMES name, plus ' B<block>'
+    only when that rabbit has several blocks in corr."""
+    units = corr.drop_duplicates('unit')
+    several_blocks = units['rabbit'].duplicated(keep=False)
+    return {unit: RABBIT_DISPLAY_NAMES[rid] + (f' B{block}' if several else '')
+            for unit, rid, block, several in zip(units['unit'], units['rabbit'], units['block'],
+                                                 several_blocks)}
+
+
+def unit_colors(names):
+    """One color per rabbit or block name, assigned over the sorted names so every figure
+    agrees; tab20 once there are more names than tab10 has colors."""
+    names = sorted(names)
+    cmap = plt.cm.tab10 if len(names) <= 10 else plt.cm.tab20
+    return dict(zip(names, cmap(np.linspace(0, 1, len(names)))))
+
+
+def unit_legend_handles(unit_color, summary_label=None):
+    """Legend entries: one dot per rabbit or block, plus a large black dot named summary_label if given."""
+    handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color,
+                          markersize=8, label=name) for name, color in unit_color.items()]
+    if summary_label is not None:
+        handles.append(plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='black',
+                                  markersize=12, label=summary_label))
+    return handles
+
+
+def plot_metric_comparison(results, model_types, metric_names, stage_label=None, cv_mode='loro'):
+    """One panel per metric: x = model type, a colored dot per held-out rabbit or block,
+    plus a large black dot for the pooled 'Overall' value."""
+    unit_color = unit_colors({name for r in results.values() for name, _ in r['per_fold']})
 
     ncols = len(metric_names)
     nrows = 1
@@ -241,8 +443,8 @@ def plot_metric_comparison(results, model_types, metric_names, stage_label=None)
 
     for ax, metric in zip(axes, metric_names):
         for xi, model_type in enumerate(model_types):
-            for rabbit_id, metrics in results[model_type]['per_fold']:
-                ax.scatter(xi, metrics[metric], color=rabbit_color[rabbit_id], s=60,
+            for held_out_name, metrics in results[model_type]['per_fold']:
+                ax.scatter(xi, metrics[metric], color=unit_color[held_out_name], s=60,
                           edgecolor='black', linewidth=0.5, zorder=3)
             ax.scatter(xi, results[model_type]['pooled'][metric], color='black', s=220, zorder=2)
         ax.set_xticks(x)
@@ -252,45 +454,291 @@ def plot_metric_comparison(results, model_types, metric_names, stage_label=None)
     for ax in axes[len(metric_names):]:
         ax.set_visible(False)
 
-    handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=rabbit_color[rid],
-                          markersize=8, label=f'Rabbit {rid}') for rid in rabbit_ids]
-    handles.append(plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='black',
-                              markersize=12, label='Overall'))
-    fig.legend(handles=handles, loc='outside right upper')
-    title = 'MR -> HnE regression: metric comparison across model architectures (LORO)'
+    fig.legend(handles=unit_legend_handles(unit_color, 'Overall'), loc='outside right upper')
+    title = f'MR -> HnE regression: metric comparison across model architectures ({cv_mode.upper()})'
     if stage_label is not None:
         title += f'  [{stage_label}]'
     fig.suptitle(title)
-    plt.show()
+    return fig
+
+
+def save_figure(fig, fig_dir, name):
+    """Write fig to fig_dir/name.png."""
+    fig.savefig(os.path.join(fig_dir, f'{name}.png'), dpi=200, bbox_inches='tight')
+
+
+def plot_feature_correlations(corr, value='spearman_rho', raw_only=False, target_label='H&E target'):
+    """Plot of per_block_correlations: one panel per contrast, x = feature variant, a colored
+    dot per block plus a large black dot for the across-block mean. raw_only: a single
+    panel of the raw contrasts instead. target_label names the target in the title."""
+    unit_color = unit_colors(corr['unit'].unique())
+    label = METRIC_LABELS.get(value, value)
+    contrasts = sorted(corr['contrast'].unique())
+    if raw_only:
+        panels = [('raw intensity', corr[corr['variant'] == 'raw'], 'contrast', contrasts)]
+    else:
+        variants = sorted(corr['variant'].unique(), key=variant_sort_key)
+        panels = [(c, corr[corr['contrast'] == c], 'variant', variants) for c in contrasts]
+
+    n_x = len(panels[0][3])
+    fig, axes = plt.subplots(len(panels), 1, figsize=(max(9, 0.6 * n_x + 3), 3 * len(panels) + 1),
+                             squeeze=False, sharex=True, sharey=True, layout='constrained')
+    for ax, (panel_title, sub, x_col, x_order) in zip(axes[:, 0], panels):
+        wide = sub.pivot(index=x_col, columns='unit', values=value).reindex(x_order)
+        x = np.arange(len(x_order))
+        for unit in wide.columns:
+            ax.scatter(x, wide[unit], color=unit_color[unit], s=60,
+                       edgecolor='black', linewidth=0.5, zorder=3)
+        ax.scatter(x, wide.mean(axis=1), color='black', s=220, zorder=2)
+        ax.axhline(0, color='gray', linestyle='--', linewidth=0.8, zorder=1)
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_order, rotation=45, ha='right')
+        ax.set_ylabel(label)
+        ax.set_title(panel_title)
+
+    fig.legend(handles=unit_legend_handles(unit_color, 'Mean'), loc='outside right upper')
+    fig.suptitle(f'{label} of each MR feature with {target_label}, within each block')
+    return fig
+
+
+@plt.rc_context({'font.size': 12})
+def plot_correlation_heatmap(corr, value='spearman_rho', variants=('raw',), target_label='H&E target'):
+    """Heatmap of per_block_correlations: rows = `variants` within each contrast, columns =
+    blocks plus an across-block mean column, each cell colored by and labeled with its value.
+    target_label names the target in the title."""
+    unit_order = list(dict.fromkeys(corr['unit']))
+    label = METRIC_LABELS.get(value, value)
+    contrasts = sorted(corr['contrast'].unique())
+    rows = [(c, v) for c in contrasts for v in variants]
+
+    wide = corr.pivot(index=['contrast', 'variant'], columns='unit', values=value)
+    wide = wide.loc[rows, unit_order]
+    grid = np.hstack([wide.to_numpy(), wide.mean(axis=1).to_numpy()[:, None]])
+
+    n_rows, n_cols = grid.shape
+    fig, ax = plt.subplots(figsize=(1.1 * n_cols + 3, 0.35 * n_rows + 1.2), layout='constrained')
+    # Full correlation range, so the color strength reads as the actual strength of association.
+    im = ax.imshow(grid, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
+    for i in range(n_rows):
+        for j in range(n_cols):
+            ax.text(j, i, f'{grid[i, j]:.2f}', ha='center', va='center',
+                    color='white' if abs(grid[i, j]) > 0.6 else 'black')
+
+    # White gaps set the mean column apart from the blocks, and each contrast from the next.
+    ax.axvline(len(unit_order) - 0.5, color='white', linewidth=4)
+    for k in range(1, len(contrasts)):
+        ax.axhline(k * len(variants) - 0.5, color='white', linewidth=4)
+
+    ax.set_xticks(np.arange(n_cols))
+    display_names = unit_display_names(corr)
+    ax.set_xticklabels([display_names[unit] for unit in unit_order] + ['Mean'])
+    if len(variants) == 1:
+        ax.set_yticks(np.arange(n_rows))
+        ax.set_yticklabels(contrasts)
+    else:
+        # Contrast names on the left, centered on their group; variant names on the right.
+        ax.set_yticks(np.arange(len(contrasts)) * len(variants) + (len(variants) - 1) / 2)
+        ax.set_yticklabels(contrasts)
+        variant_axis = ax.secondary_yaxis('right')
+        variant_axis.set_yticks(np.arange(n_rows))
+        variant_axis.set_yticklabels([v for _, v in rows])
+        variant_axis.tick_params(length=0)
+        variant_axis.spines[:].set_visible(False)
+    ax.tick_params(length=0)
+    ax.spines[:].set_visible(False)
+
+    fig.colorbar(im, ax=ax, label=label)
+    if tuple(variants) == ('raw',):
+        fig.suptitle(f'{label} of Raw MR Voxel Intensity with {target_label}')
+    else:
+        fig.suptitle(f'{label} of MR features with {target_label}, within each block')
+    return fig
+
+
+def plot_raw_feature_scatter(tables, corr, pooled=False, points_per_rabbit=3000,
+                             target_label='H&E target'):
+    """Raw MR intensity (x) vs the target (y), named target_label on the plot. Default: density
+    grid, rows = blocks, columns = contrasts, each panel annotated with its within-block rho
+    and r. pooled: one panel per contrast, a random subsample of every block's voxels colored
+    by block, with a large dot at each block's mean."""
+    raw_names = [n for n in tables[0].predictor_names if classify_predictor_stage(n) == 'stage0']
+    unit_color = unit_colors([table_label(t) for t in tables])
+    stats = corr.set_index(['unit', 'predictor'])
+
+    def valid_xy(t, name):
+        x = t.mr_features[:, list(t.predictor_names).index(name)]
+        ok = valid_row_mask(x[:, None], t.target)
+        return x[ok], t.target[ok]
+
+    if pooled:
+        rng = np.random.default_rng(0)
+        fig, axes = plt.subplots(1, len(raw_names), figsize=(4.5 * len(raw_names), 4.5),
+                                 squeeze=False, sharey=True, layout='constrained')
+        for ax, name in zip(axes[0], raw_names):
+            xs, ys, colors = [], [], []
+            for t in tables:
+                x, y = valid_xy(t, name)
+                keep = rng.choice(len(x), size=min(points_per_rabbit, len(x)), replace=False)
+                xs.append(x[keep])
+                ys.append(y[keep])
+                colors.append(np.tile(unit_color[table_label(t)], (len(keep), 1)))
+                ax.scatter(x.mean(), y.mean(), color=unit_color[table_label(t)], s=160,
+                           edgecolor='black', linewidth=1.2, zorder=3)
+            # Shuffled so no block is drawn on top of all the others.
+            order = rng.permutation(sum(len(x) for x in xs))
+            ax.scatter(np.concatenate(xs)[order], np.concatenate(ys)[order],
+                       c=np.concatenate(colors)[order], s=3, alpha=0.25, linewidths=0, zorder=2)
+            ax.set_title(name)
+            ax.set_xlabel('MR intensity')
+        axes[0, 0].set_ylabel(target_label)
+        fig.legend(handles=unit_legend_handles(unit_color), loc='outside right upper')
+        fig.suptitle(f'Raw MR intensity vs {target_label}, all blocks (large dot = block mean)')
+        return fig
+
+    fig, axes = plt.subplots(len(tables), len(raw_names),
+                             figsize=(3 * len(raw_names) + 1, 2.4 * len(tables) + 1),
+                             squeeze=False, sharex='col', sharey=True, layout='constrained')
+    densities = []
+    for row_axes, t in zip(axes, tables):
+        for ax, name in zip(row_axes, raw_names):
+            x, y = valid_xy(t, name)
+            densities.append(ax.hexbin(x, y, gridsize=40, cmap='Blues', mincnt=1))
+            s = stats.loc[(table_label(t), name)]
+            ax.text(0.03, 0.97, f"ρ={s['spearman_rho']:.2f}  r={s['pearson_r']:.2f}",
+                    transform=ax.transAxes, va='top', ha='left', fontsize=8,
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=1.5))
+        row_axes[0].set_ylabel(f'{table_label(t)}\n{target_label}')
+    for ax, name in zip(axes[0], raw_names):
+        ax.set_title(name)
+    for ax in axes[-1]:
+        ax.set_xlabel('MR intensity')
+    # One log color scale for every panel, so density is comparable across the grid.
+    shared_norm = LogNorm(vmin=1, vmax=max(d.get_array().max() for d in densities))
+    for d in densities:
+        d.set_norm(shared_norm)
+    fig.colorbar(densities[0], ax=axes, location='right', fraction=0.02, pad=0.01,
+                 label='voxels per bin')
+    fig.suptitle(f'Raw MR intensity vs {target_label}, within each block')
+    return fig
 
 
 if __name__ == '__main__':
-    BASE_DIR = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-    RABBIT_BLOCKS = {"23-055": 7, "24-103": 6, "24-240": 3, "24-082": 5, "24-101": 11, "24-058": 6}
+    BASE_DIR = rabbit_data_dir()  # this machine's ceph mount (Mac or mara)
+    RABBIT_BLOCKS = load_ready_rabbit_blocks()
     FEATURE_COL = 'mean_Nucleus_Hematoxylin_OD_mean'
+    # What to predict: 'he_feature' = FEATURE_COL from older (RL_iter1-target) voxel tables;
+    # 'class_fractions' = each class's per-voxel fraction column (one CV run per class).
+    TARGET = 'class_fractions'
+    CLASS_LABEL_SOURCE = 'R3_softmax'  # ExtractMRFeatures.py's LABEL_SOURCE
+    CLASS_NAMES = ['muscle', 'immune_cells', 'necrotic_tissue']
+    # Must match ExtractMRFeatures.py's MR_NORM_DIR and VOXEL_CSV_NAME
+    # ('voxel_features_by_id<suffix>.csv' = every contrast common to all rabbits).
+    MR_NORM_DIR = 'Normalized_method2'
+    CSV_SUFFIX = mr_norm_csv_suffix(MR_NORM_DIR) + (f'_{CLASS_LABEL_SOURCE}' if TARGET == 'class_fractions' else '')
+    # Which feature table to analyse: 'voxel' = Stage 0/1a voxel table; a number = that Stage 1b
+    # tile size (one of ExtractMRFeatures.py's TILE1B_SIZES: 3, 7, 11, 16), one row per tile.
+    FEATURE_TABLE = 'voxel'
+    if FEATURE_TABLE == 'voxel':
+        CSV_NAME, TABLE_TAG = f'voxel_features_by_id{CSV_SUFFIX}.csv', ''
+    else:
+        CSV_NAME, TABLE_TAG = f'tile_features_by_id_size{FEATURE_TABLE}{CSV_SUFFIX}.csv', f'_tile{FEATURE_TABLE}'
+    TARGET_COLS = ([FEATURE_COL] if TARGET == 'he_feature' else
+                   [class_fraction_col(c) for c in CLASS_NAMES])
     MODEL_TYPES = ['rf', 'xgboost', 'linear']
     METRIC_NAMES = ['r2', 'rmse', 'mae', 'pearson_r', 'spearman_rho']
-    # 'stage0': raw MR contrasts only (baseline). 'stage0_1a': + Stage 1a's
-    # derived gradient/neighborhood-stat columns. Run in this order so the
-    # baseline prints/plots first.
-    STAGES = ['stage0', 'stage0_1a']
+    # 'stage0' = raw MR (tile mean for a tile table) only, the baseline, runs first;
+    # 'stage0_1a' = raw + derived (voxel table); 'stage0_1b' = tile mean + radiomics (tile table).
+    STAGES = ['stage0'] if FEATURE_TABLE == 'voxel' else ['stage0', 'stage0_1b']
+    # Correlation tables always run; CV models only when RUN_MODELS is True.
+    CORR_VALUE = 'spearman_rho'  # or 'pearson_r'
+    RUN_MODELS = True
+    # 'loro' = hold out a whole rabbit (all its blocks) per fold; 'lobo' = hold out one block.
+    CV_MODE = 'loro'
+    RUN_PCA = True  # pooled PCA of all MR features, saved for building figures
+    SHOW_CORR_PLOTS = True  # correlation dot plot + raw MR vs H&E scatter (per rabbit and pooled)
+    # Outputs (metrics, NIfTIs, PCA, figures/) go to TestData/LOROPredictions/<RUN_NAME>/; use a new
+    # name per run. A tile table's folders and figures carry TABLE_TAG, so it shares a run with the voxel table.
+    RUN_NAME = 'R3_softmax_Method2'
+    SHOW_FIGURES = False  # False = save figures only, so the run never pauses on plot windows
 
     tables = []
-    for rabbit_id, block_num in RABBIT_BLOCKS.items():
-        t = load_rabbit_table(rabbit_id, block_num, BASE_DIR, 'voxel_features_by_id.csv', FEATURE_COL)
+    for rabbit_id, block_num in RABBIT_BLOCKS:
+        t = load_rabbit_table(rabbit_id, block_num, BASE_DIR, CSV_NAME, TARGET_COLS)
         if t is not None:
             tables.append(t)
 
-    print("--- Predictor standardization (Stage 0/1a) ---")
+    print(f"--- Predictor standardization ({CSV_NAME}) ---")
     common = predictor_standardization(tables)
     tables = restrict_tables_to_common_predictors(tables, common)
 
-    for stage in STAGES:
-        print(f"\n=== {stage} ===")
-        stage_tables = select_stage_predictors(tables, stage)
-        print(f"{len(stage_tables[0].predictor_names)} predictor(s) for {stage}: "
-              f"{list(stage_tables[0].predictor_names)}")
+    run_dir = Path(__file__).parent / 'TestData' / 'LOROPredictions' / RUN_NAME
+    fig_dir = str(run_dir / 'figures')
+    os.makedirs(fig_dir, exist_ok=True)
 
-        folds = rabbit_holdout_folds(stage_tables)
-        results = run_model_comparison(folds, MODEL_TYPES)
-        plot_metric_comparison(results, MODEL_TYPES, METRIC_NAMES, stage_label=stage)
+    # (target name, tables with that target, output folder name under run_dir, also the figure name prefix)
+    if TARGET == 'he_feature':
+        targets = [(FEATURE_COL, tables, f'{FEATURE_COL}{TABLE_TAG}')]
+    elif TARGET == 'class_fractions':
+        targets = [(f'{c} fraction ({CLASS_LABEL_SOURCE})',
+                    select_target(tables, class_fraction_col(c)),
+                    f'class_{CLASS_LABEL_SOURCE}_{c}{TABLE_TAG}')
+                   for c in CLASS_NAMES]
+    else:
+        raise ValueError(f"Unknown TARGET {TARGET!r}")
+
+    for target_name, target_tables, out_name in targets:
+        print(f"\n--- Per-block correlations with {target_name} (every predictor in {CSV_NAME}) ---")
+        corr = per_block_correlations(target_tables)
+        print_correlation_tables(corr, value=CORR_VALUE)
+        if SHOW_CORR_PLOTS:
+            save_figure(plot_feature_correlations(corr, value=CORR_VALUE, target_label=target_name),
+                        fig_dir, f'{out_name}_corr_dots')
+            save_figure(plot_correlation_heatmap(corr, value=CORR_VALUE, target_label=target_name),
+                        fig_dir, f'{out_name}_corr_heatmap_raw')
+            if FEATURE_TABLE == 'voxel':  # these variants are Stage 1a columns, voxel table only
+                save_figure(plot_correlation_heatmap(corr, value=CORR_VALUE,
+                                                     variants=('raw', 'nbhd_std_2d_r3', 'grad_3d'),
+                                                     target_label=target_name),
+                            fig_dir, f'{out_name}_corr_heatmap_variants')
+            save_figure(plot_raw_feature_scatter(target_tables, corr, target_label=target_name),
+                        fig_dir, f'{out_name}_scatter_per_rabbit')
+            save_figure(plot_raw_feature_scatter(target_tables, corr, pooled=True,
+                                                 target_label=target_name),
+                        fig_dir, f'{out_name}_scatter_pooled')
+            plt.show() if SHOW_FIGURES else plt.close('all')
+
+    if RUN_PCA:
+        pca_dir = str(run_dir / f'MRFeaturePCA{TABLE_TAG}')
+        os.makedirs(pca_dir, exist_ok=True)
+        scores, loadings, explained = pooled_feature_pca(tables)
+        scores.to_csv(os.path.join(pca_dir, 'pca_scores.csv'), index=False, float_format='%.5g')
+        loadings.to_csv(os.path.join(pca_dir, 'pca_loadings.csv'), index_label='predictor')
+        explained.to_csv(os.path.join(pca_dir, 'pca_explained_variance.csv'), index_label='component')
+        print(f"Saved pooled PCA scores, loadings and explained variance to {pca_dir}")
+
+    if RUN_MODELS:
+        # CV metrics table and held-out prediction NIfTIs per target, for building figures
+        # without refitting.
+        for target_name, target_tables, out_name in targets:
+            out_dir = str(run_dir / out_name)
+            os.makedirs(out_dir, exist_ok=True)
+            metrics_path = os.path.join(out_dir, f'{CV_MODE}_metrics.csv')
+            frames = []
+            for stage in STAGES:
+                print(f"\n=== {target_name}: {stage} ===")
+                stage_tables = select_stage_predictors(target_tables, stage)
+                print(f"{len(stage_tables[0].predictor_names)} predictor(s) for {stage}: "
+                      f"{list(stage_tables[0].predictor_names)}")
+
+                folds = holdout_folds(stage_tables, CV_MODE)
+                results = run_model_comparison(folds, MODEL_TYPES)
+                frames.append(results_to_frame(results, stage).assign(target=target_name))
+                pd.concat(frames, ignore_index=True).to_csv(metrics_path, index=False)
+                print(f"Saved {CV_MODE.upper()} metrics to {metrics_path}")
+                save_prediction_volumes(stage_tables, results, stage, BASE_DIR, MR_NORM_DIR, out_dir,
+                                        CV_MODE)
+                save_figure(plot_metric_comparison(results, MODEL_TYPES, METRIC_NAMES,
+                                                   stage_label=f'{target_name}, {stage}',
+                                                   cv_mode=CV_MODE),
+                            fig_dir, f'{out_name}_{CV_MODE}_{stage}_metrics')
+                plt.show() if SHOW_FIGURES else plt.close('all')

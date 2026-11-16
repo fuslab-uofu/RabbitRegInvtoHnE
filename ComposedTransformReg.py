@@ -38,8 +38,8 @@ def _load_stage(RabbitID, Block, RabbitFolder, moving_key, debug=False):
     warn_if_oblique(paths['Fixed_FilePath'])
     fixed_nib_canonical = nib.as_closest_canonical(nib.load(str(paths['Fixed_FilePath'])))
 
-    slicer_path = next(p for p in Path(paths['RegFold']).glob('*.h5') if not p.name.startswith('._'))
-    dfield_path = next(p for p in Path(paths['RegFold']).glob('*.pt') if not p.name.startswith('._'))
+    slicer_path = find_single_transform(paths['RegFold'], '.h5')
+    dfield_path = find_single_transform(paths['RegFold'], '.pt')
 
     transform = _load_transform(slicer_path)
     assert transform.GetName() in ('AffineTransform', 'MatrixOffsetTransformBase'), (

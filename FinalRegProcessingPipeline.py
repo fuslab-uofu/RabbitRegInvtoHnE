@@ -12,9 +12,10 @@ import matplotlib.pyplot as plt
 import glob
 
 #Set which Rabbit and Block we want, RabbitData is where it all lives, folder structure matters here->
+#RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
 RabbitFolder='/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
-RabbitID="R24-064"
-Block = 4
+RabbitID="R24-103"
+Block = 5
 
 #If we're working from a directory->
 RegDir = os.path.join(RabbitFolder, RabbitID, 'InVivo_MR', 'InVMRDataSets', 'Day3End_Registered')
@@ -54,8 +55,8 @@ def MultiStepReg(RabbitID, Block, RabbitFolder, MovingStart, EndFixed, interpola
         fixedimpath       = str(paths['Fixed_FilePath'])
         fixed_nib         = nib.load(fixedimpath)
         fixed_nib_canonical = nib.as_closest_canonical(fixed_nib)
-        SlicerTPath       = next((p for p in Path(paths['RegFold']).glob("*.h5") if not p.name.startswith("._")), None)
-        dfieldpath        = next((p for p in Path(paths['RegFold']).glob("*.pt") if not p.name.startswith("._")), None)
+        SlicerTPath       = find_single_transform(paths['RegFold'], ".h5")
+        dfieldpath        = find_single_transform(paths['RegFold'], ".pt")
 
         warn_if_oblique(paths['Fixed_FilePath'])
         if current_volume is None:
@@ -158,11 +159,11 @@ def MultiStartRegToFixed(RabbitID, Block, RabbitFolder, EndFixed, interpolation=
         print(f"  Saved → {out_path}")
 
 if __name__ == '__main__':
-    MultiStartRegToFixed(RabbitID, Block, RabbitFolder, "BlockFace", "linear")
+    #MultiStartRegToFixed(RabbitID, Block, RabbitFolder, "BlockFace", "linear")
 
     # Single file run through-
-    #MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='nearest')
+    MultiStepReg(RabbitID, Block, RabbitFolder, "InVivo", "BlockFace", interpolation='linear')
 
     # Run through all the files in a directory-
-    #MultiStepRegDir(RegDir, RabbitID, Block, RabbitFolder,"InVivo", "BlockFace",interpolation='nearest')
+#    MultiStepRegDir(RegDir, RabbitID, Block, RabbitFolder,"InVivo", "BlockFace",interpolation='linear')
 
