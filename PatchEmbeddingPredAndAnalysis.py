@@ -17,10 +17,10 @@ from sklearn.preprocessing import StandardScaler
 from MultiRabAnalysis import build_model
 from MSPredAndAnalysis import (CV_HOLDOUT_UNITS, classify_predictor_stage, cv_tables, holdout_folds,
                                load_rabbit_table, per_block_correlations, plot_correlation_heatmap,
-                               plot_metric_comparison, predictor_standardization, print_correlation_tables,
-                               restrict_tables_to_common_predictors, results_to_frame,
-                               run_model_comparison, save_figure, select_stage_predictors, select_target,
-                               table_label, valid_row_mask)
+                               patch_centre_footprint, plot_metric_comparison, predictor_standardization,
+                               print_correlation_tables, restrict_tables_to_common_predictors, results_to_frame,
+                               run_model_comparison, save_block_volumes, save_figure, select_stage_predictors,
+                               select_target, table_label, valid_row_mask)
 from RabbitPathFinder import (class_fraction_col, load_ready_rabbit_blocks, mr_norm_csv_suffix,
                               prediction_run_dir, rabbit_data_dir)
 
@@ -96,6 +96,22 @@ def held_out_predictions(tables, results, label):
     return pd.DataFrame(columns)
 
 
+def save_patch_prediction_volumes(predictions, target_col, base_dir, mr_norm_dir, out_dir, cv_mode, patch, stride):
+    """NIfTIs (MSPredAndAnalysis.save_block_volumes) from a predictions frame (patch_target_frame
+    plus held_out_predictions columns, as saved to <target_col>_patches.csv): every 'stage2_*'
+    prediction column as <CV>pred_<target_col>_<column>, and the patch target as
+    truth_<target_col>_stage2. Each patch's value fills its central stride x stride block."""
+    footprint = patch_centre_footprint(patch, stride)
+    columns = {col: f'{cv_mode.upper()}pred_{target_col}_{col}'
+               for col in predictions.columns if col.startswith('stage2_')}
+    columns['target'] = f'truth_{target_col}_stage2'
+    for rabbit_id, rabbit_rows in predictions.groupby('rabbit', sort=False):
+        for col, name in columns.items():
+            block_rows = [(block_num, rows['vx'].to_numpy(), rows['vy'].to_numpy(), rows['vz'].to_numpy(),
+                           rows[col].to_numpy()) for block_num, rows in rabbit_rows.groupby('block')]
+            save_block_volumes(rabbit_id, block_rows, base_dir, mr_norm_dir, out_dir, name, footprint)
+
+
 def prediction_level_summary(predictions, prediction_cols, cv_mode='loro'):
     """Per held-out fold (patch_target_frame's 'held_out'): its mean target, its training rows'
     mean target (the level its model is trained on: the other folds, or for 'lobo' the same
@@ -118,6 +134,17 @@ def prediction_level_summary(predictions, prediction_cols, cv_mode='loro'):
     return pd.DataFrame(rows).set_index('held_out')
 
 
+def single_patch_grid(t, patch):
+    """t's rows from one stride-shifted patch grid only, i.e. without staggering. The grids are
+    told apart by (vx, vy) mod patch; the one with the most patches is kept (ties: lowest phase)."""
+    phases = np.stack([t.vx % patch, t.vy % patch], axis=1)
+    phase_values, counts = np.unique(phases, axis=0, return_counts=True)
+    keep = (phases == phase_values[np.argmax(counts)]).all(axis=1)
+    return t._replace(mr_features=t.mr_features[keep], target=t.target[keep],
+                      vx=t.vx[keep], vy=t.vy[keep], vz=t.vz[keep],
+                      targets={col: values[keep] for col, values in t.targets.items()})
+
+
 def intensity_medians(tables):
     """Median of every predictor within each block (rows = blocks), to show whether one
     block's MR intensities sit at a different level from the others'."""
@@ -134,6 +161,10 @@ if __name__ == '__main__':
     CLASS_NAMES = ['muscle', 'immune_cells', 'necrotic_tissue']
     MR_NORM_DIR = 'Normalized_method2'
     PATCH_STRIDE = 4
+    PATCH_SIZE = 16  # RadioDino's patch size (ExtractMRFeatures.py's PATCH_SIZE)
+    # True = every stride-shifted patch grid (overlapping patches); False = one non-overlapping grid
+    # per block (its most-populated one), to see what staggering adds. Outputs go to stage2_unstaggered_<cv>/.
+    STAGGERED = True
     PATCH_CSV_NAME = (f'patch_embeddings_by_id_stride{PATCH_STRIDE}'
                       f'{mr_norm_csv_suffix(MR_NORM_DIR)}_{CLASS_LABEL_SOURCE}.csv')
     # A patch needs at least this fraction of its pixels covered by H&E, and by every MR contrast.
@@ -150,7 +181,7 @@ if __name__ == '__main__':
     RUN_RABBIT_ID = True
     RUN_MODELS = True
     SHOW_CORR_PLOTS = False  # heatmap of patch-mean intensity vs each class fraction
-    # Outputs go to RadPathPredictions/<CLASS_LABEL_SOURCE>_<MR_NORM_DIR>/stage2_<CV_MODE>/ on ceph,
+    # Outputs go to RadPathPredictions/<CLASS_LABEL_SOURCE>_<MR_NORM_DIR>/stage2[_unstaggered]_<CV_MODE>/ on ceph,
     # next to MSPredAndAnalysis.py's stage folders for the same labels and MR normalization.
     # Rerunning with the same CV_MODE replaces them.
 
@@ -161,6 +192,13 @@ if __name__ == '__main__':
                               min_he_coverage=MIN_HE_COVERAGE, min_mr_coverage=MIN_MR_COVERAGE)
         if t is not None:
             tables.append(t)
+    if not STAGGERED:
+        n_staggered = {table_label(t): len(t.target) for t in tables}
+        tables = [single_patch_grid(t, PATCH_SIZE) for t in tables]
+        for t in tables:
+            print(f"{table_label(t)}: one patch grid keeps {len(t.target):,}/{n_staggered[table_label(t)]:,} patches")
+    # Stage labels and output folder name the grid choice, so both can sit side by side.
+    stage_prefix = 'stage2' if STAGGERED else 'stage2_unstaggered'
 
     print("--- Predictor standardization (Stage 2) ---")
     common = predictor_standardization(tables)
@@ -180,7 +218,7 @@ if __name__ == '__main__':
     # One CV metrics CSV for Stage 2 (all PCA sizes and targets, see its 'stage' and 'target'
     # columns), as in MSPredAndAnalysis.py's stage folders, plus one held-out patch predictions
     # CSV per target and one metric figure per target and PCA size.
-    stage_dir = Path(prediction_run_dir(CLASS_LABEL_SOURCE, MR_NORM_DIR)) / f'stage2_{CV_MODE}'
+    stage_dir = Path(prediction_run_dir(CLASS_LABEL_SOURCE, MR_NORM_DIR)) / f'{stage_prefix}_{CV_MODE}'
     pred_dir, fig_dir = stage_dir / 'predictions', stage_dir / 'figures'
     os.makedirs(pred_dir, exist_ok=True)
     os.makedirs(fig_dir, exist_ok=True)
@@ -221,10 +259,12 @@ if __name__ == '__main__':
                         str(fig_dir), f'{target_col}_{label}_metrics')
             plt.close('all')
 
+        # Patch-mean raw MR only, on the same patches: the averaging baseline the embeddings must beat.
+        run_stage(f'{stage_prefix}_patchmean', select_stage_predictors(target_tables, 'stage0'), build_model)
         stage_tables = select_stage_predictors(target_tables, 'stage2')
         names = stage_tables[0].predictor_names
         for n_components in PCA_COMPONENTS:
-            run_stage(f'stage2_pca{n_components}', stage_tables,
+            run_stage(f'{stage_prefix}_pca{n_components}', stage_tables,
                       lambda model_type: embedding_pca_model(model_type, names, n_components))
 
         print(f"\n=== {target_col}: {CV_MODE.upper()} summary, mean over held-out folds ===")

@@ -131,12 +131,13 @@ STAGE_SELECTIONS = {
     'stage0': {'stage0'},
     'stage1a': {'stage0', 'stage1a'},
     'stage1b': {'stage0', 'stage1b'},
+    'stage1b_mean': {'stage0'},  # tile-mean raw MR only: the averaging baseline for stage1b's radiomics
     'stage2': {'stage2'},
 }
 # The ExtractMRFeatures.py table each stage reads: stage0/stage1a the voxel table, stage1b a tile
 # table (its tile-mean MR columns count as 'stage0' there, so stage1b = tile mean + radiomics),
 # stage2 the patch table (analysed by PatchEmbeddingPredAndAnalysis.py).
-STAGE_TABLES = {'stage0': 'voxel', 'stage1a': 'voxel', 'stage1b': 'tile', 'stage2': 'patch'}
+STAGE_TABLES = {'stage0': 'voxel', 'stage1a': 'voxel', 'stage1b': 'tile', 'stage1b_mean': 'tile', 'stage2': 'patch'}
 # Single-neighbourhood Stage 1a stages, 'stage1a_<neighbourhood>' (e.g. 'stage1a_2d_r3'): only that
 # neighbourhood's mean and std of each contrast, no raw intensity, to compare spatial scales.
 STAGE1A_NEIGHBOURHOODS = ['2d_r1', '2d_r3', '2d_r5', '2d_r7', '3d_r1', '3d_r3']
@@ -381,32 +382,86 @@ def results_to_frame(results, stage):
     return pd.DataFrame(rows)
 
 
-def save_prediction_volumes(tables, results, target_col, stage, base_dir, mr_norm_dir, out_dir, cv_mode='loro'):
-    """Write each model's held-out prediction of target_col for every block to out_dir as a
-    NIfTI on that rabbit's MR grid (the grid the feature tables index; NaN where there is no
-    prediction), for viewing in Slicer over the MR volumes read from mr_norm_dir. A rabbit with
-    several blocks also gets their mean (R<id>_AllBlocks_...), to view its blocks together."""
+def paint_footprints(volume, size, corner_offset):
+    """Copy of a row-voxel volume (one value at each tile or patch's row voxel, NaN elsewhere) with
+    each value painted over a size x size square on axes 0 and 2, one axis-1 slice thick, whose
+    corner is corner_offset voxels before the row voxel on both axes; clipped at the volume edge.
+    Stops if two squares overlap."""
+    filled = np.full(volume.shape, np.nan, dtype=volume.dtype)
+    for a0, a1, a2 in np.argwhere(np.isfinite(volume)):
+        x0, y0 = a0 - corner_offset, a2 - corner_offset
+        footprint = filled[max(x0, 0):min(x0 + size, volume.shape[0]), a1,
+                           max(y0, 0):min(y0 + size, volume.shape[2])]
+        if np.isfinite(footprint).any():
+            raise ValueError(f"Square at voxel {(a0, a1, a2)} overlaps an already painted one")
+        footprint[:] = volume[a0, a1, a2]
+    return filled
+
+
+def tile_footprint(tile_size):
+    """paint_footprints (size, corner_offset) covering a whole tile: its row voxel sits
+    (tile_size - 1) // 2 from the tile's corner (extract_mri_embedding.patch_pixel_center)."""
+    return tile_size, (tile_size - 1) // 2
+
+
+def patch_centre_footprint(patch, stride):
+    """paint_footprints (size, corner_offset) covering a patch's central stride x stride block.
+    Patches on a stride lattice have these blocks tile the plane, each voxel in exactly one."""
+    return stride, (patch - 1) // 2 - (patch - stride) // 2
+
+
+def save_block_volumes(rabbit_id, block_rows, base_dir, mr_norm_dir, out_dir, name, footprint=None):
+    """Write one rabbit's values as a NIfTI per block on its MR grid (the grid the feature tables
+    index; NaN where there is no value), for viewing in Slicer over the MR volumes read from
+    mr_norm_dir. block_rows = [(block_num, vx, vy, vz, values)]; each value goes at its row voxel,
+    or over footprint = (size, corner_offset), see paint_footprints. Files are
+    R<id>_BlockNN_<name>.nii.gz, plus their mean R<id>_AllBlocks_<name>.nii.gz for several blocks."""
+    target = mr_grid_reference(day3end_mr_dir(base_dir, rabbit_id, mr_norm_dir))
+    block_volumes = []
+    for block_num, vx, vy, vz, values in block_rows:
+        volume = np.full(target.shape, np.nan, dtype=np.float32)
+        # CSV coordinates are (axis0, axis2, axis1) indices, see extract_voxelwise_features.
+        volume[vx, vz, vy] = values
+        if footprint is not None:
+            volume = paint_footprints(volume, *footprint)
+        out_path = os.path.join(out_dir, f'R{rabbit_id}_Block{block_num:02d}_{name}.nii.gz')
+        nib.save(nib.Nifti1Image(volume, target.affine), out_path)
+        print(f"Saved {out_path}")
+        block_volumes.append(volume)
+    if len(block_volumes) > 1:
+        out_path = os.path.join(out_dir, f'R{rabbit_id}_AllBlocks_{name}.nii.gz')
+        nib.save(nib.Nifti1Image(mean_over_blocks(np.stack(block_volumes)), target.affine), out_path)
+        print(f"Saved {out_path}")
+
+
+def save_prediction_volumes(tables, results, target_col, stage, base_dir, mr_norm_dir, out_dir, cv_mode='loro',
+                            footprint=None):
+    """save_block_volumes of each model's held-out prediction of target_col for every block, as
+    <CV>pred_<target_col>_<stage>_<model>. footprint (tile tables, see tile_footprint): each
+    tile's prediction fills its footprint instead of its single row voxel."""
     tables_by_rabbit = {}
     for t in tables:
         tables_by_rabbit.setdefault(t.rabbit_id, []).append(t)
-    name = f'{cv_mode.upper()}pred_{target_col}_{stage}'
     for rabbit_id, rabbit_tables in tables_by_rabbit.items():
-        target = mr_grid_reference(day3end_mr_dir(base_dir, rabbit_id, mr_norm_dir))
         for model_type, r in results.items():
-            block_volumes = []
+            block_rows = []
             for t in rabbit_tables:
                 test_mask, y_pred = r['predictions'][(t.rabbit_id, t.block_num)]
-                volume = np.full(target.shape, np.nan, dtype=np.float32)
-                # CSV coordinates are (axis0, axis2, axis1) indices, see extract_voxelwise_features.
-                volume[t.vx[test_mask], t.vz[test_mask], t.vy[test_mask]] = y_pred
-                out_path = os.path.join(out_dir, f'R{rabbit_id}_Block{t.block_num:02d}_{name}_{model_type}.nii.gz')
-                nib.save(nib.Nifti1Image(volume, target.affine), out_path)
-                print(f"Saved {out_path}")
-                block_volumes.append(volume)
-            if len(block_volumes) > 1:
-                out_path = os.path.join(out_dir, f'R{rabbit_id}_AllBlocks_{name}_{model_type}.nii.gz')
-                nib.save(nib.Nifti1Image(mean_over_blocks(np.stack(block_volumes)), target.affine), out_path)
-                print(f"Saved {out_path}")
+                block_rows.append((t.block_num, t.vx[test_mask], t.vy[test_mask], t.vz[test_mask], y_pred))
+            save_block_volumes(rabbit_id, block_rows, base_dir, mr_norm_dir, out_dir,
+                               f'{cv_mode.upper()}pred_{target_col}_{stage}_{model_type}', footprint)
+
+
+def save_target_volumes(tables, target_col, stage, base_dir, mr_norm_dir, out_dir, footprint=None):
+    """save_block_volumes of every block's target (what the models were trained to predict) as
+    truth_<target_col>_<stage>, painted over the same footprint as the predictions."""
+    tables_by_rabbit = {}
+    for t in tables:
+        tables_by_rabbit.setdefault(t.rabbit_id, []).append(t)
+    for rabbit_id, rabbit_tables in tables_by_rabbit.items():
+        block_rows = [(t.block_num, t.vx, t.vy, t.vz, t.target) for t in rabbit_tables]
+        save_block_volumes(rabbit_id, block_rows, base_dir, mr_norm_dir, out_dir,
+                           f'truth_{target_col}_{stage}', footprint)
 
 
 def voxel_class_labels(vx, vy, vz, label_path, target_grid_path):
@@ -713,7 +768,8 @@ if __name__ == '__main__':
     #   'stage1a_<nbhd>' = one neighbourhood's mean + std per voxel, nbhd in STAGE1A_NEIGHBOURHOODS
     #               (e.g. 'stage1a_2d_r3'; add them all with [f'stage1a_{n}' for n in STAGE1A_NEIGHBOURHOODS]);
     #   'stage1b' = tile-mean MR + radiomics per TILE1B_SIZE tile ('linear' is unreliable here:
-    #               plain least squares on hundreds of correlated radiomics; read rf/xgboost).
+    #               plain least squares on hundreds of correlated radiomics; read rf/xgboost);
+    #   'stage1b_mean' = tile-mean MR only on the same tiles, the baseline stage1b's radiomics must beat.
     STAGES = ['stage0', 'stage1a', 'stage1b']
     TILE1B_SIZE = 16  # one of ExtractMRFeatures.py's TILE1B_SIZES (3, 7, 11, 16)
     STAGE_CSV_NAMES = {'voxel': f'voxel_features_by_id{CSV_SUFFIX}.csv',
@@ -814,6 +870,7 @@ if __name__ == '__main__':
                 metrics_path = str(stage_dir / 'metrics.csv')
                 pd.concat(frames, ignore_index=True).to_csv(metrics_path, index=False)
                 print(f"Saved {CV_MODE.upper()} metrics to {metrics_path}")
+                # Tile stages are saved at each tile's row voxel; filled maps are made on demand from these.
                 save_prediction_volumes(stage_tables, results, target_col, stage_label, BASE_DIR, MR_NORM_DIR,
                                         pred_dir, CV_MODE)
                 save_figure(plot_metric_comparison(results, MODEL_TYPES, METRIC_NAMES,
