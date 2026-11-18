@@ -16,9 +16,11 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 from MultiRabAnalysis import build_model
+from CombineBlockNiftis import mean_over_blocks
 from PullMRFeaturesByVoxel import mr_grid_reference
 from RabbitPathFinder import (block_analysis_dir, block_label, class_fraction_col, day3end_mr_dir,
-                              load_ready_rabbit_blocks, mr_norm_csv_suffix, rabbit_data_dir)
+                              load_ready_rabbit_blocks, mr_norm_csv_suffix, prediction_run_dir,
+                              rabbit_data_dir)
 
 # One analysed rabbit block's rows; a rabbit with several analysed blocks has one table per block.
 # targets = {column: values} for every target column loaded; target = the one in use (select_target).
@@ -40,9 +42,11 @@ def valid_row_mask(mr_features, target):
 def load_rabbit_table(rabbit_id, block_num, base_dir, csv_name, target_cols,
                       min_he_coverage=None, min_mr_coverage=None):
     """Load one rabbit block's table (one row per voxel, tile or patch, from ExtractMRFeatures.py).
-    Every column except vx/vy/vz, the target_cols and the '*_coverage_frac' columns is an MR
-    predictor. target starts as target_cols[0]; select_target switches it. Tile/patch rows below
-    min_he_coverage, or below min_mr_coverage in any contrast, are dropped."""
+    Every column except vx/vy/vz, the target_cols, the '*_coverage_frac' columns and every H&E
+    class '*_fraction' column is an MR predictor (so loading a subset of the classes never makes
+    the other classes' fractions predictors). target starts as target_cols[0]; select_target
+    switches it. Tile/patch rows below min_he_coverage, or below min_mr_coverage in any contrast,
+    are dropped."""
     name = block_label(rabbit_id, block_num)
     path = os.path.join(block_analysis_dir(base_dir, rabbit_id, block_num), csv_name)
     if not os.path.exists(path):
@@ -60,7 +64,8 @@ def load_rabbit_table(rabbit_id, block_num, base_dir, csv_name, target_cols,
         print(f"{name}: {len(df):,}/{n_rows:,} row(s) kept at coverage thresholds "
               f"H&E {min_he_coverage}, MR {min_mr_coverage}")
     predictor_names = np.array([c for c in df.columns
-                                if c not in ('vx', 'vy', 'vz', *target_cols, *coverage_cols)])
+                                if c not in ('vx', 'vy', 'vz', *target_cols, *coverage_cols)
+                                and not c.endswith('_fraction')])
     targets = {col: df[col].to_numpy(dtype=float) for col in target_cols}
     return RabbitTable(
         rabbit_id=rabbit_id,
@@ -132,18 +137,31 @@ STAGE_SELECTIONS = {
 # table (its tile-mean MR columns count as 'stage0' there, so stage1b = tile mean + radiomics),
 # stage2 the patch table (analysed by PatchEmbeddingPredAndAnalysis.py).
 STAGE_TABLES = {'stage0': 'voxel', 'stage1a': 'voxel', 'stage1b': 'tile', 'stage2': 'patch'}
+# Single-neighbourhood Stage 1a stages, 'stage1a_<neighbourhood>' (e.g. 'stage1a_2d_r3'): only that
+# neighbourhood's mean and std of each contrast, no raw intensity, to compare spatial scales.
+STAGE1A_NEIGHBOURHOODS = ['2d_r1', '2d_r3', '2d_r5', '2d_r7', '3d_r1', '3d_r3']
+STAGE_TABLES.update({f'stage1a_{nbhd}': 'voxel' for nbhd in STAGE1A_NEIGHBOURHOODS})
 
 
 def select_stage_predictors(tables, stage):
-    """Keep one STAGE_SELECTIONS entry's predictors, e.g. 'stage0' = raw MR intensity only,
-    'stage1a' = raw + derived, 'stage1b' = tile mean + radiomics, 'stage2' = embeddings."""
-    if stage not in STAGE_SELECTIONS:
-        raise ValueError(f"Unknown stage: {stage!r}, expected one of {sorted(STAGE_SELECTIONS)}")
-    kept_classes = STAGE_SELECTIONS[stage]
+    """Keep one stage's predictors, e.g. 'stage0' = raw MR intensity only, 'stage1a' = raw +
+    derived, 'stage1a_2d_r3' = 2D r3 neighbourhood mean + std only, 'stage1b' = tile mean +
+    radiomics, 'stage2' = embeddings."""
+    if stage not in STAGE_TABLES:
+        raise ValueError(f"Unknown stage: {stage!r}, expected one of {sorted(STAGE_TABLES)}")
+    if stage in STAGE_SELECTIONS:
+        def keep(name):
+            return classify_predictor_stage(name) in STAGE_SELECTIONS[stage]
+    else:
+        nbhd = stage.removeprefix('stage1a_')
+        def keep(name):
+            return name.endswith((f'_nbhd_mean_{nbhd}', f'_nbhd_std_{nbhd}'))
 
     restricted = []
     for t in tables:
-        idx = [i for i, n in enumerate(t.predictor_names) if classify_predictor_stage(n) in kept_classes]
+        idx = [i for i, n in enumerate(t.predictor_names) if keep(n)]
+        if not idx:
+            raise ValueError(f"{table_label(t)} has no predictors for {stage!r}")
         restricted.append(t._replace(predictor_names=t.predictor_names[idx], mr_features=t.mr_features[:, idx]))
     return restricted
 
@@ -363,21 +381,32 @@ def results_to_frame(results, stage):
     return pd.DataFrame(rows)
 
 
-def save_prediction_volumes(tables, results, stage, base_dir, mr_norm_dir, out_dir, cv_mode='loro'):
-    """Write each model's held-out prediction for every block to out_dir as a NIfTI on that
-    rabbit's MR grid (the grid the feature tables index; NaN where there is no prediction),
-    for viewing in Slicer over the MR volumes read from mr_norm_dir."""
+def save_prediction_volumes(tables, results, target_col, stage, base_dir, mr_norm_dir, out_dir, cv_mode='loro'):
+    """Write each model's held-out prediction of target_col for every block to out_dir as a
+    NIfTI on that rabbit's MR grid (the grid the feature tables index; NaN where there is no
+    prediction), for viewing in Slicer over the MR volumes read from mr_norm_dir. A rabbit with
+    several blocks also gets their mean (R<id>_AllBlocks_...), to view its blocks together."""
+    tables_by_rabbit = {}
     for t in tables:
-        prefix = f'R{t.rabbit_id}_Block{t.block_num:02d}'
-        target = mr_grid_reference(day3end_mr_dir(base_dir, t.rabbit_id, mr_norm_dir))
+        tables_by_rabbit.setdefault(t.rabbit_id, []).append(t)
+    name = f'{cv_mode.upper()}pred_{target_col}_{stage}'
+    for rabbit_id, rabbit_tables in tables_by_rabbit.items():
+        target = mr_grid_reference(day3end_mr_dir(base_dir, rabbit_id, mr_norm_dir))
         for model_type, r in results.items():
-            test_mask, y_pred = r['predictions'][(t.rabbit_id, t.block_num)]
-            volume = np.full(target.shape, np.nan, dtype=np.float32)
-            # CSV coordinates are (axis0, axis2, axis1) indices, see extract_voxelwise_features.
-            volume[t.vx[test_mask], t.vz[test_mask], t.vy[test_mask]] = y_pred
-            out_path = os.path.join(out_dir, f'{prefix}_{cv_mode.upper()}pred_{stage}_{model_type}.nii.gz')
-            nib.save(nib.Nifti1Image(volume, target.affine), out_path)
-            print(f"Saved {out_path}")
+            block_volumes = []
+            for t in rabbit_tables:
+                test_mask, y_pred = r['predictions'][(t.rabbit_id, t.block_num)]
+                volume = np.full(target.shape, np.nan, dtype=np.float32)
+                # CSV coordinates are (axis0, axis2, axis1) indices, see extract_voxelwise_features.
+                volume[t.vx[test_mask], t.vz[test_mask], t.vy[test_mask]] = y_pred
+                out_path = os.path.join(out_dir, f'R{rabbit_id}_Block{t.block_num:02d}_{name}_{model_type}.nii.gz')
+                nib.save(nib.Nifti1Image(volume, target.affine), out_path)
+                print(f"Saved {out_path}")
+                block_volumes.append(volume)
+            if len(block_volumes) > 1:
+                out_path = os.path.join(out_dir, f'R{rabbit_id}_AllBlocks_{name}_{model_type}.nii.gz')
+                nib.save(nib.Nifti1Image(mean_over_blocks(np.stack(block_volumes)), target.affine), out_path)
+                print(f"Saved {out_path}")
 
 
 def voxel_class_labels(vx, vy, vz, label_path, target_grid_path):
@@ -419,17 +448,17 @@ def class_fraction_tables(tables, class_name, label_source, base_dir):
 
 METRIC_LABELS = {'r2': 'R²', 'rmse': 'RMSE', 'mae': 'MAE', 'pearson_r': 'Pearson r', 'spearman_rho': 'Spearman ρ'}
 
-# Rabbit labels shown on figures. Add new rabbits at the end so existing numbers never change.
-RABBIT_DISPLAY_NAMES = {"23-055": "Rabbit 1", "24-103": "Rabbit 2", "24-240": "Rabbit 3", "24-082": "Rabbit 4",
-                        "24-101": "Rabbit 5", "24-058": "Rabbit 6", "24-064": "Rabbit 7", "24-104": "Rabbit 8"}
+# A badly offset held-out fold's R² can reach the -100s and flatten every other fold onto 0, so
+# the R² axis stops here and lower values sit on it as down-triangles labelled with their value.
+R2_AXIS_FLOOR = -1.0
 
 
 def unit_display_names(corr):
-    """{corr 'unit': figure label}: the rabbit's RABBIT_DISPLAY_NAMES name, plus ' B<block>'
-    only when that rabbit has several blocks in corr."""
+    """{corr 'unit': figure label}: the rabbit ID ('R23-055'), plus ' B<block>' only when that
+    rabbit has several blocks in corr."""
     units = corr.drop_duplicates('unit')
     several_blocks = units['rabbit'].duplicated(keep=False)
-    return {unit: RABBIT_DISPLAY_NAMES[rid] + (f' B{block}' if several else '')
+    return {unit: f'R{rid}' + (f' B{block}' if several else '')
             for unit, rid, block, several in zip(units['unit'], units['rabbit'], units['block'],
                                                  several_blocks)}
 
@@ -452,9 +481,22 @@ def unit_legend_handles(unit_color, summary_label=None):
     return handles
 
 
+def scatter_above_floor(ax, x, value, floor, label_row=0, **scatter_kwargs):
+    """ax.scatter of one value; a value below floor is drawn on the floor as a down-triangle
+    labelled with its true value, the label raised by label_row lines so labels at one x don't
+    overlap. Returns whether the value was below floor."""
+    if not value < floor:  # also plots NaN as usual (nothing drawn)
+        ax.scatter(x, value, **scatter_kwargs)
+        return False
+    ax.scatter(x, floor, marker='v', **scatter_kwargs)
+    ax.annotate(f'{value:.3g}', (x, floor), xytext=(9, 9 * label_row), textcoords='offset points',
+                fontsize=7, va='center', color=scatter_kwargs.get('color', 'black'))
+    return True
+
+
 def plot_metric_comparison(results, model_types, metric_names, stage_label=None, cv_mode='loro'):
     """One panel per metric: x = model type, a colored dot per held-out rabbit or block,
-    plus a large black dot for the pooled 'Overall' value."""
+    plus a large black dot for the pooled 'Overall' value. R² is cut off at R2_AXIS_FLOOR."""
     unit_color = unit_colors({name for r in results.values() for name, _ in r['per_fold']})
 
     ncols = len(metric_names)
@@ -465,11 +507,15 @@ def plot_metric_comparison(results, model_types, metric_names, stage_label=None,
     x = np.arange(len(model_types))
 
     for ax, metric in zip(axes, metric_names):
+        floor = R2_AXIS_FLOOR if metric == 'r2' else -np.inf
         for xi, model_type in enumerate(model_types):
+            n_clipped = 0
             for held_out_name, metrics in results[model_type]['per_fold']:
-                ax.scatter(xi, metrics[metric], color=unit_color[held_out_name], s=60,
-                          edgecolor='black', linewidth=0.5, zorder=3)
-            ax.scatter(xi, results[model_type]['pooled'][metric], color='black', s=220, zorder=2)
+                n_clipped += scatter_above_floor(ax, xi, metrics[metric], floor, label_row=n_clipped,
+                                                 color=unit_color[held_out_name], s=60,
+                                                 edgecolor='black', linewidth=0.5, zorder=3)
+            scatter_above_floor(ax, xi, results[model_type]['pooled'][metric], floor, label_row=n_clipped,
+                                color='black', s=220, zorder=2)
         ax.set_xticks(x)
         ax.set_xticklabels(model_types)
         ax.set_title(METRIC_LABELS.get(metric, metric))
@@ -664,6 +710,8 @@ if __name__ == '__main__':
     # Stages to model, in order (Stage 2 runs in PatchEmbeddingPredAndAnalysis.py):
     #   'stage0'  = raw MR per voxel (the baseline);
     #   'stage1a' = raw MR + neighbourhood/gradient features per voxel;
+    #   'stage1a_<nbhd>' = one neighbourhood's mean + std per voxel, nbhd in STAGE1A_NEIGHBOURHOODS
+    #               (e.g. 'stage1a_2d_r3'; add them all with [f'stage1a_{n}' for n in STAGE1A_NEIGHBOURHOODS]);
     #   'stage1b' = tile-mean MR + radiomics per TILE1B_SIZE tile ('linear' is unreliable here:
     #               plain least squares on hundreds of correlated radiomics; read rf/xgboost).
     STAGES = ['stage0', 'stage1a', 'stage1b']
@@ -678,8 +726,9 @@ if __name__ == '__main__':
     CV_MODE = 'loro'
     RUN_PCA = True  # pooled PCA of the voxel table's MR features, saved for building figures
     SHOW_CORR_PLOTS = True  # correlation dot plot + raw MR vs H&E scatter (per block and pooled)
-    # Outputs (metrics, NIfTIs, PCA, figures/) go to TestData/LOROPredictions/<RUN_NAME>/; use a new name per run.
-    RUN_NAME = 'R3_softmax_Method2'
+    # Outputs go to RadPathPredictions/<label source or FEATURE_COL>_<MR_NORM_DIR>/ on ceph: one
+    # <stage>_<CV_MODE> folder per stage (metrics, predictions/, figures/) plus correlations_pca/.
+    # Rerunning a stage with the same CV_MODE replaces that folder's outputs.
     SHOW_FIGURES = False  # False = save figures only, so the run never pauses on plot windows
 
     def load_feature_tables(csv_name):
@@ -699,60 +748,60 @@ if __name__ == '__main__':
     tables_by_kind = {kind: load_feature_tables(STAGE_CSV_NAMES[kind]) for kind in sorted(needed_tables)}
     voxel_tables = tables_by_kind['voxel']
 
-    run_dir = Path(__file__).parent / 'TestData' / 'LOROPredictions' / RUN_NAME
-    fig_dir = str(run_dir / 'figures')
-    os.makedirs(fig_dir, exist_ok=True)
+    run_dir = Path(prediction_run_dir(CLASS_LABEL_SOURCE if TARGET == 'class_fractions' else FEATURE_COL,
+                                      MR_NORM_DIR))
+    # Voxel-table outputs made once per run rather than per stage.
+    corr_pca_dir = str(run_dir / 'correlations_pca')
+    os.makedirs(corr_pca_dir, exist_ok=True)
 
-    # (target name, target column, output folder name under run_dir, also the figure name prefix)
+    # (target name, target column, also the output file name prefix)
     if TARGET == 'he_feature':
-        targets = [(FEATURE_COL, FEATURE_COL, FEATURE_COL)]
+        targets = [(FEATURE_COL, FEATURE_COL)]
     elif TARGET == 'class_fractions':
-        targets = [(f'{c} fraction ({CLASS_LABEL_SOURCE})', class_fraction_col(c), f'class_{CLASS_LABEL_SOURCE}_{c}')
-                   for c in CLASS_NAMES]
+        targets = [(f'{c} fraction ({CLASS_LABEL_SOURCE})', class_fraction_col(c)) for c in CLASS_NAMES]
     else:
         raise ValueError(f"Unknown TARGET {TARGET!r}")
 
-    for target_name, target_col, out_name in targets:
+    for target_name, target_col in targets:
         target_tables = select_target(voxel_tables, target_col)
         print(f"\n--- Per-block correlations with {target_name} (voxel table: Stage 0 raw + Stage 1a derived) ---")
         corr = per_block_correlations(target_tables)
         print_correlation_tables(corr, value=CORR_VALUE)
         if SHOW_CORR_PLOTS:
             save_figure(plot_feature_correlations(corr, value=CORR_VALUE, target_label=target_name),
-                        fig_dir, f'{out_name}_corr_dots')
+                        corr_pca_dir, f'{target_col}_corr_dots')
             save_figure(plot_correlation_heatmap(corr, value=CORR_VALUE, target_label=target_name),
-                        fig_dir, f'{out_name}_corr_heatmap_raw')
+                        corr_pca_dir, f'{target_col}_corr_heatmap_raw')
             save_figure(plot_correlation_heatmap(corr, value=CORR_VALUE,
                                                  variants=('raw', 'nbhd_std_2d_r3', 'grad_3d'),
                                                  target_label=target_name),
-                        fig_dir, f'{out_name}_corr_heatmap_variants')
+                        corr_pca_dir, f'{target_col}_corr_heatmap_variants')
             save_figure(plot_raw_feature_scatter(target_tables, corr, target_label=target_name),
-                        fig_dir, f'{out_name}_scatter_per_rabbit')
+                        corr_pca_dir, f'{target_col}_scatter_per_rabbit')
             save_figure(plot_raw_feature_scatter(target_tables, corr, pooled=True,
                                                  target_label=target_name),
-                        fig_dir, f'{out_name}_scatter_pooled')
+                        corr_pca_dir, f'{target_col}_scatter_pooled')
             plt.show() if SHOW_FIGURES else plt.close('all')
 
     if RUN_PCA:
-        pca_dir = str(run_dir / 'MRFeaturePCA')
-        os.makedirs(pca_dir, exist_ok=True)
         scores, loadings, explained = pooled_feature_pca(voxel_tables)
-        scores.to_csv(os.path.join(pca_dir, 'pca_scores.csv'), index=False, float_format='%.5g')
-        loadings.to_csv(os.path.join(pca_dir, 'pca_loadings.csv'), index_label='predictor')
-        explained.to_csv(os.path.join(pca_dir, 'pca_explained_variance.csv'), index_label='component')
-        print(f"Saved pooled PCA scores, loadings and explained variance to {pca_dir}")
+        scores.to_csv(os.path.join(corr_pca_dir, 'pca_scores.csv'), index=False, float_format='%.5g')
+        loadings.to_csv(os.path.join(corr_pca_dir, 'pca_loadings.csv'), index_label='predictor')
+        explained.to_csv(os.path.join(corr_pca_dir, 'pca_explained_variance.csv'), index_label='component')
+        print(f"Saved pooled PCA scores, loadings and explained variance to {corr_pca_dir}")
 
     if RUN_MODELS:
-        # CV metrics table and held-out prediction NIfTIs per target, for building figures
-        # without refitting.
-        for target_name, target_col, out_name in targets:
-            out_dir = str(run_dir / out_name)
-            os.makedirs(out_dir, exist_ok=True)
-            metrics_path = os.path.join(out_dir, f'{CV_MODE}_metrics.csv')
-            frames = []
+        # Per stage folder: one CV metrics CSV (all targets, see its 'target' column), held-out
+        # prediction NIfTIs and metric figures, for building figures without refitting.
+        stage_frames = {}  # stage label -> metrics frames of the targets run so far
+        for target_name, target_col in targets:
             for stage in STAGES:
                 # Names the tile size for stage1b, so runs at different sizes keep separate outputs.
                 stage_label = f'{stage}_tile{TILE1B_SIZE}' if STAGE_TABLES[stage] == 'tile' else stage
+                stage_dir = run_dir / f'{stage_label}_{CV_MODE}'
+                pred_dir, fig_dir = str(stage_dir / 'predictions'), str(stage_dir / 'figures')
+                os.makedirs(pred_dir, exist_ok=True)
+                os.makedirs(fig_dir, exist_ok=True)
                 print(f"\n=== {target_name}: {stage_label} ===")
                 table = select_target(tables_by_kind[STAGE_TABLES[stage]], target_col)
                 stage_tables = cv_tables(select_stage_predictors(table, stage), CV_MODE)
@@ -760,13 +809,15 @@ if __name__ == '__main__':
 
                 folds = holdout_folds(stage_tables, CV_MODE)
                 results = run_model_comparison(folds, MODEL_TYPES)
+                frames = stage_frames.setdefault(stage_label, [])
                 frames.append(results_to_frame(results, stage_label).assign(target=target_name))
+                metrics_path = str(stage_dir / 'metrics.csv')
                 pd.concat(frames, ignore_index=True).to_csv(metrics_path, index=False)
                 print(f"Saved {CV_MODE.upper()} metrics to {metrics_path}")
-                save_prediction_volumes(stage_tables, results, stage_label, BASE_DIR, MR_NORM_DIR, out_dir,
-                                        CV_MODE)
+                save_prediction_volumes(stage_tables, results, target_col, stage_label, BASE_DIR, MR_NORM_DIR,
+                                        pred_dir, CV_MODE)
                 save_figure(plot_metric_comparison(results, MODEL_TYPES, METRIC_NAMES,
                                                    stage_label=f'{target_name}, {stage_label}',
                                                    cv_mode=CV_MODE),
-                            fig_dir, f'{out_name}_{CV_MODE}_{stage_label}_metrics')
+                            fig_dir, f'{target_col}_metrics')
                 plt.show() if SHOW_FIGURES else plt.close('all')

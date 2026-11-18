@@ -14,8 +14,9 @@ import numpy as np
 import pandas as pd
 
 from BuildBFromTile224Features import build_b_and_Q_from_tile_features
+from CombineBlockNiftis import block_count, block_paths, mean_over_blocks, stack_block_volumes
 from NewtonAdjointInit import normalized_adjoint_init
-from RabbitPathFinder import load_ready_rabbit_blocks
+from RabbitPathFinder import class_fraction_col, he_projection_dir, load_ready_rabbit_blocks
 
 ANNOTATIONS_DIR = Path('/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/'
                        'HnE_Classification/Annotations')
@@ -82,6 +83,33 @@ def project_rabbit_classes(RabbitID, Block, RabbitFolder, channels):
             print(f"Saved MR-grid H&E coverage -> {coverage_path}")
 
 
+def combine_rabbit_blocks(rabbit_id, blocks, channels):
+    """For viewing one multi-block rabbit's histology together (not used in feature extraction):
+    a map of how many blocks have H&E in each voxel, and each class's fraction averaged over the
+    blocks covering a voxel. Reads every block's saved maps, so they all must be projected."""
+    maps = ['he_coverage'] + [class_fraction_col(c) for c in channels]
+    missing = [p for m in maps for p in block_paths(rabbit_id, blocks, LABEL_SOURCE, m) if not os.path.exists(p)]
+    if missing:
+        print(f"Skipping R{rabbit_id} block combine, missing {len(missing)} map(s), e.g. {missing[0]}")
+        return
+    out_dir = he_projection_dir(LABEL_SOURCE)
+    os.makedirs(out_dir, exist_ok=True)
+    prefix = os.path.join(out_dir, f'R{rabbit_id}_AllBlocks_MR')
+
+    stack, affine = stack_block_volumes(block_paths(rabbit_id, blocks, LABEL_SOURCE, 'he_coverage'))
+    count = block_count(stack)
+    print(f"R{rabbit_id} blocks {blocks}, voxels by number of blocks with histology:",
+          {int(n): int((count == n).sum()) for n in np.unique(count) if n > 0})
+    nib.save(nib.Nifti1Image(count, affine), f'{prefix}_he_block_count.nii.gz')
+    print(f"Saved block-overlap count -> {prefix}_he_block_count.nii.gz")
+
+    for map_name in maps[1:]:
+        stack, affine = stack_block_volumes(block_paths(rabbit_id, blocks, LABEL_SOURCE, map_name))
+        out_path = f'{prefix}_{map_name}_block_mean.nii.gz'
+        nib.save(nib.Nifti1Image(mean_over_blocks(stack), affine), out_path)
+        print(f"Saved block-mean fraction -> {out_path}")
+
+
 if __name__ == '__main__':
     RabbitFolder = '/System/Volumes/Data/ceph/hifu/users/jbonaventura/RabbitRegistrationProj/RabbitData'
     # Same rabbits/blocks as MSPredAndAnalysis.py ('R' prefix added below).
@@ -91,3 +119,11 @@ if __name__ == '__main__':
 
     for rabbit_id, block in RABBIT_BLOCKS:
         project_rabbit_classes(f'R{rabbit_id}', block, RabbitFolder, channels)
+
+    # Rabbits with several ready blocks also get their blocks combined (from the saved maps).
+    blocks_by_rabbit = {}
+    for rabbit_id, block in RABBIT_BLOCKS:
+        blocks_by_rabbit.setdefault(rabbit_id, []).append(block)
+    for rabbit_id, blocks in blocks_by_rabbit.items():
+        if len(blocks) > 1:
+            combine_rabbit_blocks(rabbit_id, blocks, channels)

@@ -29,6 +29,24 @@ def rabbit_data_dir():
     return os.path.join(rabbit_reg_proj_dir(), 'RabbitData')
 
 
+def prediction_results_dir():
+    """RadPathPredictions (MR -> H&E model outputs) on this machine's ceph mount."""
+    return os.path.join(rabbit_reg_proj_dir(), 'RadPathPredictions')
+
+
+def he_projection_dir(label_source):
+    """HnE_Proj_toMRI/<label source>/ on this machine's ceph mount: H&E class maps on the MR grid
+    combined over a rabbit's blocks (ProjectClassPredictionsToMR.py), for viewing."""
+    return os.path.join(rabbit_reg_proj_dir(), 'HnE_Proj_toMRI', label_source)
+
+
+def prediction_run_dir(target_source, mr_norm_dir):
+    """RadPathPredictions/<target source>_<MR normalization>/: every MR -> H&E model output
+    predicting one H&E target set (e.g. the 'R3_softmax' annotations) from one MR
+    normalization, with a subfolder per stage."""
+    return os.path.join(prediction_results_dir(), f'{target_source}_{mr_norm_dir}')
+
+
 def load_ready_rabbit_blocks(csv_path=None):
     """[(rabbit ID without its 'R' prefix, block number), ...] from ReadyRabbits.csv (default:
     the one in RabbitRegistrationProj), the rabbit blocks whose MR registration and histology

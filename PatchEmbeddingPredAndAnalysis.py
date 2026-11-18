@@ -17,11 +17,12 @@ from sklearn.preprocessing import StandardScaler
 from MultiRabAnalysis import build_model
 from MSPredAndAnalysis import (CV_HOLDOUT_UNITS, classify_predictor_stage, cv_tables, holdout_folds,
                                load_rabbit_table, per_block_correlations, plot_correlation_heatmap,
-                               predictor_standardization, print_correlation_tables,
+                               plot_metric_comparison, predictor_standardization, print_correlation_tables,
                                restrict_tables_to_common_predictors, results_to_frame,
-                               run_model_comparison, select_stage_predictors, select_target,
+                               run_model_comparison, save_figure, select_stage_predictors, select_target,
                                table_label, valid_row_mask)
-from RabbitPathFinder import class_fraction_col, load_ready_rabbit_blocks, mr_norm_csv_suffix, rabbit_data_dir
+from RabbitPathFinder import (class_fraction_col, load_ready_rabbit_blocks, mr_norm_csv_suffix,
+                              prediction_run_dir, rabbit_data_dir)
 
 
 def embedding_pca_model(model_type, predictor_names, n_components):
@@ -139,6 +140,7 @@ if __name__ == '__main__':
     MIN_HE_COVERAGE = 0.5
     MIN_MR_COVERAGE = 0.5
     MODEL_TYPES = ['rf', 'xgboost', 'linear']
+    METRIC_NAMES = ['r2', 'rmse', 'mae', 'pearson_r', 'spearman_rho']
     # Embedding PCs kept per fold; every value is run and reported.
     PCA_COMPONENTS = [10, 25, 50]
     CORR_VALUE = 'spearman_rho'  # or 'pearson_r'
@@ -148,8 +150,9 @@ if __name__ == '__main__':
     RUN_RABBIT_ID = True
     RUN_MODELS = True
     SHOW_CORR_PLOTS = False  # heatmap of patch-mean intensity vs each class fraction
-    # Outputs go to TestData/PatchEmbeddingCV/<RUN_NAME>/<class>/; use a new name per run.
-    RUN_NAME = 'R3_softmax_Method2'
+    # Outputs go to RadPathPredictions/<CLASS_LABEL_SOURCE>_<MR_NORM_DIR>/stage2_<CV_MODE>/ on ceph,
+    # next to MSPredAndAnalysis.py's stage folders for the same labels and MR normalization.
+    # Rerunning with the same CV_MODE replaces them.
 
     target_cols = [class_fraction_col(c) for c in CLASS_NAMES]
     tables = []
@@ -174,8 +177,16 @@ if __name__ == '__main__':
             accuracy = rabbit_id_accuracy(select_stage_predictors(tables, 'stage2'), n_components=n_components)
             print(f"embeddings, top {n_components} PCs: {accuracy:.2f}")
 
-    run_dir = Path(__file__).parent / 'TestData' / 'PatchEmbeddingCV' / RUN_NAME
-    for class_name, target_col in zip(CLASS_NAMES, target_cols):
+    # One CV metrics CSV for Stage 2 (all PCA sizes and targets, see its 'stage' and 'target'
+    # columns), as in MSPredAndAnalysis.py's stage folders, plus one held-out patch predictions
+    # CSV per target and one metric figure per target and PCA size.
+    stage_dir = Path(prediction_run_dir(CLASS_LABEL_SOURCE, MR_NORM_DIR)) / f'stage2_{CV_MODE}'
+    pred_dir, fig_dir = stage_dir / 'predictions', stage_dir / 'figures'
+    os.makedirs(pred_dir, exist_ok=True)
+    os.makedirs(fig_dir, exist_ok=True)
+    metrics_path = str(stage_dir / 'metrics.csv')
+    all_frames = []  # metrics frames of every target and PCA size run so far
+    for target_col in target_cols:
         target_tables = select_target(tables, target_col)
 
         print(f"\n--- Per-block correlations of patch-mean MR intensity with {target_col} ---")
@@ -187,11 +198,8 @@ if __name__ == '__main__':
 
         if not RUN_MODELS:
             continue
-        out_dir = str(run_dir / class_name)
-        os.makedirs(out_dir, exist_ok=True)
-        metrics_path = os.path.join(out_dir, f'{CV_MODE}_metrics.csv')
-        predictions_path = os.path.join(out_dir, f'{CV_MODE}_predictions.csv')
-        frames = []
+        predictions_path = str(pred_dir / f'{target_col}_patches.csv')
+        frames = []  # this target's metrics frames, for its summary
         # Every stage shares the same patches, so predictions are added as columns.
         predictions = patch_target_frame(cv_tables(target_tables, CV_MODE), CV_MODE)
 
@@ -200,12 +208,18 @@ if __name__ == '__main__':
             print(f"\n=== {target_col}: {label} ({len(stage_tables[0].predictor_names)} predictor(s)) ===")
             results = run_model_comparison(holdout_folds(stage_tables, CV_MODE), MODEL_TYPES,
                                            model_builder=model_builder)
-            frames.append(results_to_frame(results, label).assign(target=target_col))
-            pd.concat(frames, ignore_index=True).to_csv(metrics_path, index=False)
+            frame = results_to_frame(results, label).assign(target=target_col)
+            frames.append(frame)
+            all_frames.append(frame)
+            pd.concat(all_frames, ignore_index=True).to_csv(metrics_path, index=False)
             for col, values in held_out_predictions(stage_tables, results, label).items():
                 predictions[col] = values
             predictions.to_csv(predictions_path, index=False, float_format='%.5g')
             print(f"Saved {CV_MODE.upper()} metrics to {metrics_path} and predictions to {predictions_path}")
+            save_figure(plot_metric_comparison(results, MODEL_TYPES, METRIC_NAMES,
+                                               stage_label=f'{target_col}, {label}', cv_mode=CV_MODE),
+                        str(fig_dir), f'{target_col}_{label}_metrics')
+            plt.close('all')
 
         stage_tables = select_stage_predictors(target_tables, 'stage2')
         names = stage_tables[0].predictor_names
